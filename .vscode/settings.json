@@ -1,0 +1,6 @@
+{
+    "workbench.editor.enablePreview": false,
+    "cursor.general.disableHttp2": true,
+    "workbench.preferredDarkColorTheme": "Default High Contrast",
+    "workbench.colorTheme": "Visual Studio Dark"
+}
