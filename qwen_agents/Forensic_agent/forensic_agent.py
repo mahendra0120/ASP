@@ -2,7 +2,33 @@ from huggingface_hub import login
 #from google.colab import userdata
 import torch
 import os
+from typing import Optional
+from pydantic_ai import Agent
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from pydantic_ai.mcp import MCPServerSSE, MCPServerStdio
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+def _make_model(
+    model_id: str,
+    *,
+    adapter_path: Optional[str] = None,
+    processor_path: Optional[str] = None,
+    temperature: float = 0.1,
+)
+
+MCP_PORT = int(os.getenv("MCP_SERVER_PORT", "9000"))
+ 
+# Vision tools + A2A delegation — connects to FastMCP SSE server
+mcp_toolset = MCPServerSSE(url=f"http://localhost:{MCP_PORT}/sse")
+ 
+# Standard filesystem server — read_file, list_directory, get_file_info
+# Sandboxed to SKILLS_DIR so agents can only read their own skill files.
+# Requires Node.js >= 18 for npx.
+filesystem_toolset = MCPServerStdio(
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
+    env={**os.environ},
 
 # default: Load the model on the available device(s)
 model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -55,3 +81,30 @@ output_text = processor.batch_decode(
     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
 )
 print(output_text)
+
+class ForensicResult(BaseModel):
+    """Output of Agent 2 — Synthesis Agent."""
+    task_id:                   str
+    executive_summary:         str
+    key_insights:              list[str] = Field(min_length=1)
+    recommendations:           list[str] = Field(min_length=1)
+    seo_tags:                  list[str]
+    accessibility_description: str
+    quality_score:             float = Field(ge=0.0, le=10.0)
+    timestamp:                 str
+
+forensic_agent: Agent[None, ForensicResult] = Agent(
+    model=_make_model(_SYNTHESIS_MODEL_ID),
+    output_type=SynthesisResult,
+    system_prompt=(
+        "You are a Qwen2-VL synthesis agent.\n\n"
+        f"BEFORE doing anything else, call read_file('{SYNTHESIS_SKILL}') "
+        "to load your operating instructions, then follow every step exactly.\n\n"
+        "Toolsets available:\n"
+        "  • Filesystem — read_file, list_directory, get_file_info\n"
+        "  • Vision-tools — store_result, get_result, utc_now, log_event"
+    ),
+    toolsets=[mcp_toolset, filesystem_toolset],
+    retries=2,
+)
+
