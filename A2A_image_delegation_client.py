@@ -1,3 +1,23 @@
+"""
+A2A_image_delegation_client.py
+─────────────────────────────────────────────────────────────────
+Minimal JSON-RPC client for talking to fasta2a-served agents.
+
+NOTE: this was originally written against an older draft of the A2A
+spec. The installed fasta2a implements the current spec, where:
+  - the send method is `message/send`, not `tasks/send`
+  - the client sends a `Message` (role/parts/messageId/kind), not a
+    task with a client-chosen id — the server assigns the task id
+  - `Part` is a `kind`-discriminated union: `{"kind": "text", ...}`,
+    `{"kind": "file", "file": {"uri": ..., "mimeType": ...}}`, or
+    `{"kind": "data", "data": ...}` — not a flat `{"url": ...}`
+  - `Message` itself needs `"kind": "message"`
+  - a completed task's state is `"completed"`, not `"success"`
+  - artifacts carry their content in `artifact["parts"]`, each of
+    which may have a `text` field — not directly on the artifact
+`tasks/get` and `tasks/cancel` are unchanged from the older draft.
+"""
+
 import os
 import json
 import httpx
@@ -10,26 +30,34 @@ from typing import Any, Optional
 @dataclass
 class TextPart:
     text: str
-    type: str = "text"
 
     def to_dict(self) -> dict:
-        return {"type": self.type, "text": self.text}
+        return {"kind": "text", "text": self.text}
 
 @dataclass
 class ImagePart:
     url: str
-    type: str = "url"
+    media_type: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {"type": self.type, "url": self.url}
+        file_obj = {"uri": self.url}
+        if self.media_type:
+            file_obj["mimeType"] = self.media_type
+        return {"kind": "file", "file": file_obj}
 
 @dataclass
 class A2AMessage:
     parts: list[TextPart | ImagePart]
     role: str = "user"
+    message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict:
-        return {"role": self.role, "parts": [p.to_dict() for p in self.parts]}
+        return {
+            "kind": "message",
+            "role": self.role,
+            "parts": [p.to_dict() for p in self.parts],
+            "messageId": self.message_id,
+        }
 
 #Task Result
 
@@ -42,14 +70,19 @@ class A2ATask:
 
     @property
     def success(self) -> bool:
-        return self.state == "success"
-    
+        return self.state == "completed"
+
     @property
     def failed(self) -> bool:
-        return self.state == "failed"
+        return self.state in ("failed", "rejected")
 
     def output(self) -> str:
-        return "\n".join(a.get("text", "") for a in self.artifacts if a.get("type") == "text")
+        texts = []
+        for artifact in self.artifacts:
+            for part in artifact.get("parts", []):
+                if "text" in part:
+                    texts.append(part["text"])
+        return "\n".join(texts)
 
     def json_output(self) -> Any:
         text = self.output()
@@ -72,15 +105,12 @@ class A2AClient:
     async def send_task(
         self,
         message: A2AMessage,
-        task_id: Optional[str] = None,
         metadata: Optional[dict] = None) -> A2ATask:
-        task_id = task_id or str(uuid.uuid4())
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
-            "method": "tasks/send",
+            "method": "message/send",
             "params": {
-                "id": task_id,
                 "message": message.to_dict(),
                 **({"metadata": metadata} if metadata else {})
             }
@@ -92,11 +122,11 @@ class A2AClient:
             body = r.json()
 
         if "error" in body:
-            return A2ATask(id = task_id, state = "failed", error = str(body["error"]))
+            return A2ATask(id = message.message_id, state = "failed", error = str(body["error"]))
 
         res = body.get("result", {})
         return A2ATask(
-            id = res.get("id", task_id),
+            id = res.get("id", message.message_id),
             state = res.get("status", {}).get("state", "unknown"),
             artifacts = res.get("artifacts", [])
         )

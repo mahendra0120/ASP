@@ -159,7 +159,7 @@ async def step_profiler(image_url: str, prompt: str, forensic_json: dict):
 # Gradio UI
 # =============================================
 
-with gr.Blocks(title="A2A Multi-Agent Pipeline", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
     gr.Markdown("# 🧠 A2A 2-Agent Vision Pipeline\nForensic → Profiler | Image Upload + Extra Context")
 
     with gr.Row():
@@ -216,5 +216,6 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name="0.0.0.0",
         server_port=7860,
-        inbrowser=True
+        inbrowser=True,
+        theme=gr.themes.Soft(),
     )

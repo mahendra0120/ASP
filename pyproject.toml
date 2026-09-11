@@ -9,7 +9,7 @@ dependencies = [
     "a2a-sdk>=1.0.2",
     "beautifulsoup4>=4.15.0",
     "bs4>=0.0.2",
-    "datasets>=5.0.1",
+    "datasets>=4.0,<4.8.6",
     "fasta2a[pydantic-ai]>=0.6.1",
     "fastmcp>=4.0.3",
     "fastparquet>=2026.5.0",
@@ -36,7 +36,7 @@ dependencies = [
     "sse-starlette>=3.4.2",
     "starlette>=1.0.0",
     "torch>=2.12.1",
-    "transformers>=5.12.1",
+    "transformers>=5.1.0,<=5.5.0",
     "unsloth>=2026.9.1",
     "uvicorn>=0.46.0",
 ]

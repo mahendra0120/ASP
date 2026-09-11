@@ -22,6 +22,7 @@ from huggingface_hub import login
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
+from fastmcp.client import Client as FastMCPClient
 from fastmcp.client.transports import StdioTransport
 
 from qwen_agents.model_utils import make_model
@@ -46,21 +47,32 @@ PROFILER_SKILL = SKILLS_DIR / "criminal-behavioral-analysis" / "SKILL.md"
 # skill markdown, never the Forensic agent's files (it has none) or
 # anything else on the filesystem. Requires Node.js >= 18 for npx.
 #
+# `init_timeout` is set generously because the FIRST time this runs on a
+# fresh pod/volume, `npx -y @modelcontextprotocol/server-filesystem` has
+# to download that package from the npm registry before it can respond
+# to the MCP handshake at all — the default timeout is too short for a
+# cold npx install and causes a spurious "Failed to initialize server
+# session" error on first run. Subsequent runs are fast since npm caches
+# the package (put the npm cache on the network volume too, e.g. via
+# `npm config set cache /workspace/.npm-cache`, so this stays fast across
+# pod restarts).
+#
 # NOTE: this repo was originally written against `MCPServerStdio` /
 # `MCPServerSSE`, which pydantic-ai removed in 2.0 in favor of a single
-# `MCPToolset` built on FastMCP's `Client`. Pinning back below 2.0 to
-# keep the old classes isn't an option here: `fasta2a[pydantic-ai]`
-# (used to serve these agents over A2A — see A2A_image_delegation_server.py)
-# hard-requires pydantic-ai-slim>=2.40.0, so this repo needs post-2.0
-# pydantic-ai either way. Using MCPToolset is what actually gets both
-# the skill-file MCP access and the A2A serving working together.
-skills_toolset = MCPToolset(
+# `MCPToolset` built on FastMCP's `Client` — passing a pre-built `Client`
+# (rather than a bare transport) is what lets us set `init_timeout`.
+# `fasta2a[pydantic-ai]` (used to serve these agents over A2A — see
+# A2A_image_delegation_server.py) hard-requires pydantic-ai-slim>=2.40.0,
+# so this repo needs post-2.0 pydantic-ai either way.
+skills_client = FastMCPClient(
     StdioTransport(
         command="npx",
         args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
         env={**os.environ},
-    )
+    ),
+    init_timeout=60,
 )
+skills_toolset = MCPToolset(skills_client)
 
 
 class BoundingBox(BaseModel):
