@@ -85,20 +85,27 @@ async def run_pipeline_async(image_url: str, prompt: str, extra_context: str):
         if extra_context and extra_context.strip():
             full_prompt += f"\n\nAdditional Context:\n{extra_context}"
 
-        profiler_data = await step_profiler(image_url, full_prompt)
-        forensic_data = await step_forensic(profiler_data)
+        # 1) The case image(s) (e.g. showing the body) go straight to the
+        #    Forensic agent over A2A. It has no MCP/skill access — it just
+        #    analyzes what's in front of it.
+        forensic_data = await step_forensic(image_url, full_prompt)
+
+        # 2) The Forensic agent's result is then forwarded over A2A to the
+        #    Profiler agent, which is the only agent with MCP access
+        #    (to its own criminal-behavioral-analysis skill markdown).
+        profiler_data = await step_profiler(image_url, full_prompt, forensic_data)
 
         final_result = {
             "task_id": task_id,
-            "profiler": profiler_data,
             "forensic": forensic_data,
+            "profiler": profiler_data,
         }
 
         Path("pipeline_result.json").write_text(json.dumps(final_result, indent=2))
 
         return (
-            json.dumps(profiler_data, indent=2),
             json.dumps(forensic_data, indent=2),
+            json.dumps(profiler_data, indent=2),
             json.dumps(final_result, indent=2),
             "✅ Pipeline completed successfully!",
         )
@@ -125,21 +132,27 @@ def run_pipeline(image, image_url, prompt, extra_context):
         return [error] * 4
 
 
-async def step_profiler(image_url: str, prompt: str):
-    task = await PROFILER_AGENT.send_task(
+async def step_forensic(image_url: str, prompt: str):
+    """Send the relevant case image(s) straight to the Forensic agent via A2A."""
+    task = await FORENSIC_AGENT.send_task(
         A2AMessage(parts=[TextPart(prompt), ImagePart(url=image_url)])
     )
     if task.failed:
-        raise RuntimeError(f"Profiler agent failed: {task.error}")
+        raise RuntimeError(f"Forensic agent failed: {task.error}")
     return task.json_output()
 
 
-async def step_forensic(profiler_json: dict):
-    task = await FORENSIC_AGENT.send_task(
-        A2AMessage(parts=[TextPart(json.dumps(profiler_json, indent=2))])
+async def step_profiler(image_url: str, prompt: str, forensic_json: dict):
+    """Forward the Forensic agent's result (+ original image/notes) to the Profiler agent."""
+    combined_prompt = (
+        f"{prompt}\n\nForensic agent result (from A2A):\n"
+        f"{json.dumps(forensic_json, indent=2)}"
+    )
+    task = await PROFILER_AGENT.send_task(
+        A2AMessage(parts=[TextPart(combined_prompt), ImagePart(url=image_url)])
     )
     if task.failed:
-        raise RuntimeError(f"Forensic agent failed: {task.error}")
+        raise RuntimeError(f"Profiler agent failed: {task.error}")
     return task.json_output()
 
 # =============================================
@@ -147,7 +160,7 @@ async def step_forensic(profiler_json: dict):
 # =============================================
 
 with gr.Blocks(title="A2A Multi-Agent Pipeline", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🧠 A2A 2-Agent Vision Pipeline\nProfiler → Forensic | Image Upload + Extra Context")
+    gr.Markdown("# 🧠 A2A 2-Agent Vision Pipeline\nForensic → Profiler | Image Upload + Extra Context")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -181,9 +194,9 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline", theme=gr.themes.Soft()) as demo
 
     with gr.Row():
         with gr.Column():
-            profiler_out = gr.Code(label="🔍 Profiler Agent", language="json", lines=12)
+            forensic_out = gr.Code(label="🔬 Forensic Agent (no MCP)", language="json", lines=12)
         with gr.Column():
-            forensic_out = gr.Code(label="🔬 Forensic Agent", language="json", lines=12)
+            profiler_out = gr.Code(label="🔍 Profiler Agent (MCP: skills/ only)", language="json", lines=12)
 
     with gr.Accordion("📄 Full Result", open=False):
         full_out = gr.Code(label="Complete JSON", language="json", lines=15)
@@ -194,7 +207,7 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline", theme=gr.themes.Soft()) as demo
     run_btn.click(
         fn=run_pipeline,
         inputs=[image_input, url_input, prompt, extra_context],
-        outputs=[profiler_out, forensic_out, full_out, status_out],
+        outputs=[forensic_out, profiler_out, full_out, status_out],
     )
 
     gr.Markdown("**Tip:** You can upload an image **and** add extra context text.")

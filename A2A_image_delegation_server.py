@@ -10,7 +10,11 @@ FORENSIC_PORT = int(os.getenv('FORENSIC_AGENT_PORT', '8002'))
 profiler_app = agent_to_a2a(
     profiler_agent,
     name = "Profiler agent",
-    description = ("Building a serial killer profile from crime scene images"),
+    description = (
+        "Builds a behavioral profile from the Forensic agent's findings "
+        "(received via A2A) plus case images. The only agent with MCP "
+        "access, scoped to its own criminal-behavioral-analysis skill file."
+    ),
     version = "1.0.0",
     url=f"http://localhost:{PROFILER_PORT}"
 )
@@ -20,7 +24,11 @@ profiler_app = agent_to_a2a(
 Forensic_app = agent_to_a2a(
     forensic_agent,
     name = "Forensic agent",
-    description = ("Analysing crime scene images"),
+    description = (
+        "Analyzes the case image(s) it's given (e.g. images of a body) and "
+        "returns structured forensic findings. No MCP — there is no "
+        "forensic skill file, so this agent has no tools."
+    ),
     version = "1.0.0",
     url=f"http://localhost:{FORENSIC_PORT}"
 )

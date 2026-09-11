@@ -1,110 +1,82 @@
-from huggingface_hub import login
-#from google.colab import userdata
-import torch
+"""
+forensic_agent.py
+─────────────────────────────────────────────────────────────────
+Agent 2 in the pipeline — receives the image(s) relevant to the case
+(e.g. the shot(s) showing the body) directly over A2A and produces a
+structured ForensicResult.
+
+IMPORTANT — no MCP here on purpose:
+There is no forensic-skill markdown file for this agent to read, so
+it is NOT given the filesystem MCP server, and it does not need the
+vision-tools/A2A-delegation MCP server either — the caller (main.py,
+via the A2A client) is what drives the pipeline and forwards this
+agent's result on to the Profiler agent afterwards. This agent's job
+is only: image(s) in -> ForensicResult out.
+"""
+
 import os
-from typing import Optional
-from pydantic_ai import Agent
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
+from huggingface_hub import login
 from pydantic import BaseModel, Field
-from pydantic_ai.mcp import MCPServerSSE, MCPServerStdio
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from pydantic_ai import Agent
 
-def _make_model(
-    model_id: str,
-    *,
-    adapter_path: Optional[str] = None,
-    processor_path: Optional[str] = None,
-    temperature: float = 0.1,
+from qwen_agents.model_utils import make_model
+
+load_dotenv()
+
+if os.getenv("HF_TOKEN"):
+    login(token=os.getenv("HF_TOKEN"))
+
+# Fine-tuned forensic model. `make_model` pulls this down via
+# huggingface_hub.snapshot_download the first time it's loaded.
+FORENSIC_MODEL_ID = os.getenv(
+    "FORENSIC_MODEL_ID",
+    "mahendra0120/Forensic-Agent-4.0-2026-09-08_14.31.12",
 )
 
-MCP_PORT = int(os.getenv("MCP_SERVER_PORT", "9000"))
- 
-# Vision tools + A2A delegation — connects to FastMCP SSE server
-mcp_toolset = MCPServerSSE(url=f"http://localhost:{MCP_PORT}/sse")
- 
-# Standard filesystem server — read_file, list_directory, get_file_info
-# Sandboxed to SKILLS_DIR so agents can only read their own skill files.
-# Requires Node.js >= 18 for npx.
-filesystem_toolset = MCPServerStdio(
-    command="npx",
-    args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
-    env={**os.environ},
-
-# default: Load the model on the available device(s)
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Kizzington/Qwen3-VL-8B-Thinking-heretic", dtype="auto", device_map="auto"
-)
-
-# We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-# model = Qwen3VLForConditionalGeneration.from_pretrained(
-#     "Qwen/Qwen3-VL-8B-Thinking",
-#     dtype=torch.bfloat16,
-#     attn_implementation="flash_attention_2",
-#     device_map="auto",
-# )
-
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Thinking")
-
-image_path = "/content/image.png"
-if not os.path.exists(image_path):
-    raise FileNotFoundError(f"Image file not found at: {image_path}. Please ensure the image is uploaded or the path is correct.")
-
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": image_path,
-            },
-            {"type": "text", "text": "Describe this image."},
-        ],
-    }
-]
-
-# Preparation for inference
-inputs = processor.apply_chat_template(
-    messages,
-    tokenize=True,
-    add_generation_prompt=True,
-    return_dict=True,
-    return_tensors="pt"
-)
-inputs = inputs.to(model.device)
-
-# Inference: Generation of the output
-generated_ids = model.generate(**inputs, max_new_tokens=128)
-generated_ids_trimmed = [
-    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-]
-output_text = processor.batch_decode(
-    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-)
-print(output_text)
 
 class ForensicResult(BaseModel):
-    """Output of Agent 2 — Synthesis Agent."""
-    task_id:                   str
-    executive_summary:         str
-    key_insights:              list[str] = Field(min_length=1)
-    recommendations:           list[str] = Field(min_length=1)
-    seo_tags:                  list[str]
-    accessibility_description: str
-    quality_score:             float = Field(ge=0.0, le=10.0)
-    timestamp:                 str
+    """Output of Agent 2 — Forensic Agent."""
 
+    task_id: str
+    executive_summary: str
+    key_insights: list[str] = Field(min_length=1)
+    recommendations: list[str] = Field(min_length=1)
+    seo_tags: list[str] = Field(default_factory=list)
+    accessibility_description: str
+    quality_score: float = Field(ge=0.0, le=10.0)
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+# No toolsets — no MCP servers of any kind are attached to this agent.
 forensic_agent: Agent[None, ForensicResult] = Agent(
-    model=_make_model(_SYNTHESIS_MODEL_ID),
-    output_type=SynthesisResult,
+    model=make_model(FORENSIC_MODEL_ID),
+    output_type=ForensicResult,
     system_prompt=(
-        "You are a Qwen2-VL synthesis agent.\n\n"
-        f"BEFORE doing anything else, call read_file('{SYNTHESIS_SKILL}') "
-        "to load your operating instructions, then follow every step exactly.\n\n"
-        "Toolsets available:\n"
-        "  • Filesystem — read_file, list_directory, get_file_info\n"
-        "  • Vision-tools — store_result, get_result, utc_now, log_event"
+        "You are a forensic image-analysis agent. You are given one or more "
+        "images relevant to a case (for example, images showing a body) and "
+        "any accompanying notes.\n\n"
+        "You have no tools and no external skill file — analyze only what is "
+        "visible in the image(s) you were given and produce your findings "
+        "directly as the required structured output. Be precise, factual, "
+        "and avoid speculation beyond what the image evidence supports."
     ),
-    toolsets=[mcp_toolset, filesystem_toolset],
+    toolsets=[],
     retries=2,
 )
 
+
+async def run_forensic_analysis(task_id: str, prompt: str) -> ForensicResult:
+    """
+    Convenience entry point for direct (non-A2A) use, e.g. from tests.
+
+    `prompt` should already describe/embed the image(s) to analyze —
+    when served over A2A (see A2A_image_delegation_server.py), the
+    image parts and text sent by the caller are what the agent sees.
+    """
+    result = await forensic_agent.run(f"[task_id={task_id}]\n\n{prompt}")
+    return result.output

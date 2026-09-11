@@ -1,139 +1,130 @@
-from huggingface_hub import login
-#from google.colab import userdata
-import torch
+"""
+profiler_agent.py
+─────────────────────────────────────────────────────────────────
+Agent 1 in the pipeline — takes the ForensicResult produced by
+Agent 2 (received over A2A) plus the original case images/notes and
+builds the behavioral profile.
+
+This is the ONLY agent in the pipeline that gets an MCP server, and
+it is scoped to exactly one thing: read-only filesystem access to
+THIS agent's own skills markdown folder
+(`.agents/skills/criminal-behavioral-analysis/`). The Forensic agent
+has no skill file, so it gets no MCP at all (see forensic_agent.py).
+"""
+
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
-from pydantic_ai import Agent
+
 from dotenv import load_dotenv
+from huggingface_hub import login
 from pydantic import BaseModel, Field
-from pydantic_ai.mcp import MCPServerSSE, MCPServerStdio
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from pydantic_ai import Agent
+from pydantic_ai.mcp import MCPToolset
+from fastmcp.client.transports import StdioTransport
+
+from qwen_agents.model_utils import make_model
 
 load_dotenv()
 
-Profiler_SKILL = "qwen_agents\Profiler_agent\.agents\skills\criminal-behavioral-analysis\SKILL.md"
+if os.getenv("HF_TOKEN"):
+    login(token=os.getenv("HF_TOKEN"))
 
-MCP_PORT = int(os.getenv("MCP_SERVER_PORT", "9000"))
- 
-# Vision tools + A2A delegation — connects to FastMCP SSE server
-mcp_toolset = MCPServerSSE(url=f"http://localhost:{MCP_PORT}/sse")
- 
-# Standard filesystem server — read_file, list_directory, get_file_info
-# Sandboxed to SKILLS_DIR so agents can only read their own skill files.
-# Requires Node.js >= 18 for npx.
-filesystem_toolset = MCPServerStdio(
-    command="npx",
-    args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
-    env={**os.environ},
+# make_model pulls this down via huggingface_hub.snapshot_download the
+# first time it's loaded.
+PROFILER_MODEL_ID = os.getenv(
+    "PROFILER_MODEL_ID", "Kizzington/Qwen3-VL-8B-Thinking-heretic"
 )
 
-# default: Load the model on the available device(s)
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Kizzington/Qwen3-VL-8B-Thinking-heretic", dtype="auto", device_map="auto"
+# Sandbox root: only this agent's skills folder, nothing else on disk.
+SKILLS_DIR = Path(__file__).parent / ".agents" / "skills"
+PROFILER_SKILL = SKILLS_DIR / "criminal-behavioral-analysis" / "SKILL.md"
+
+# Standard filesystem MCP server — read_file, list_directory, get_file_info.
+# Sandboxed to SKILLS_DIR so the Profiler agent can only ever read its own
+# skill markdown, never the Forensic agent's files (it has none) or
+# anything else on the filesystem. Requires Node.js >= 18 for npx.
+#
+# NOTE: this repo was originally written against `MCPServerStdio` /
+# `MCPServerSSE`, which pydantic-ai removed in 2.0 in favor of a single
+# `MCPToolset` built on FastMCP's `Client`. Pinning back below 2.0 to
+# keep the old classes isn't an option here: `fasta2a[pydantic-ai]`
+# (used to serve these agents over A2A — see A2A_image_delegation_server.py)
+# hard-requires pydantic-ai-slim>=2.40.0, so this repo needs post-2.0
+# pydantic-ai either way. Using MCPToolset is what actually gets both
+# the skill-file MCP access and the A2A serving working together.
+skills_toolset = MCPToolset(
+    StdioTransport(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
+        env={**os.environ},
+    )
 )
 
-# We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-# model = Qwen3VLForConditionalGeneration.from_pretrained(
-#     "Qwen/Qwen3-VL-8B-Thinking",
-#     dtype=torch.bfloat16,
-#     attn_implementation="flash_attention_2",
-#     device_map="auto",
-# )
-
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Thinking")
-
-image_path = "/content/image.png"
-if not os.path.exists(image_path):
-    raise FileNotFoundError(f"Image file not found at: {image_path}. Please ensure the image is uploaded or the path is correct.")
-
-messages = [
-    {
-        "role": "system",
-        "content": "You are a criminal profiler.\n\n"
-        f"BEFORE doing anything else, call read_file('{Profiler_SKILL}') "
-        "to load your operating instructions, then follow every step exactly.\n\n"
-        "MCP servers available:\n"
-        "fetch_image_base64, delegate_image_to_synthesis, "
-        "delegate_to_expert_agent, store_result, utc_now, log_event"
-
-    },
-
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "image": image_path,
-            },
-            {"type": "text", "text": "Describe this image."},
-        ],
-    }
-]
-
-# Preparation for inference
-inputs = processor.apply_chat_template(
-    messages,
-    tokenize=True,
-    add_generation_prompt=True,
-    return_dict=True,
-    return_tensors="pt"
-)
-inputs = inputs.to(model.device)
-
-# Inference: Generation of the output
-generated_ids = model.generate(**inputs, max_new_tokens=128)
-generated_ids_trimmed = [
-    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-]
-output_text = processor.batch_decode(
-    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-)
-print(output_text)
-
-def _make_model(
-    model_id: str,
-    *,
-    adapter_path: Optional[str] = None,
-    processor_path: Optional[str] = None,
-    temperature: float = 0.1,
-):
 
 class BoundingBox(BaseModel):
-    label:      str
+    label: str
     confidence: float = Field(ge=0.0, le=1.0)
-    position:   str   = Field(description="Rough position in frame: top-left, center …")
- 
- 
+    position: str = Field(description="Rough position in frame: top-left, center …")
+
+
 class ProfileAnalysis(BaseModel):
-    """Output of Agent 1 — Profile Analyzer."""
-    task_id:           str
+    """Output of Agent 1 — Profiler Agent."""
+
+    task_id: str
     scene_description: str
-    objects:           list[BoundingBox]
-    text_content:      Optional[str] = None
-    dominant_colors:   list[str]
-    context_category:  str = Field(
+    objects: list[BoundingBox] = Field(default_factory=list)
+    text_content: Optional[str] = None
+    dominant_colors: list[str] = Field(default_factory=list)
+    context_category: str = Field(
         description="nature | urban | product | document | person | other"
     )
-    mood:              str
-    confidence:        float = Field(ge=0.0, le=1.0)
-    timestamp:         str
-    forensic_result:  Optional[str] = Field(
+    mood: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    forensic_result: Optional[str] = Field(
         None,
-        description="ForensicResult JSON if Agent 1 auto-delegated to Agent 2"
+        description=(
+            "The ForensicResult JSON received from the Forensic agent over "
+            "A2A, which this profile is built on top of."
+        ),
     )
 
+
 profile_agent: Agent[None, ProfileAnalysis] = Agent(
-    model=_make_model(_VISUAL_MODEL_ID),
-    output_type=ProfileAnalysis,                  # was result_type= in older pydantic-ai
+    model=make_model(PROFILER_MODEL_ID),
+    output_type=ProfileAnalysis,
     system_prompt=(
-        "You are a Qwen2-VL visual analyst agent.\n\n"
-        f"BEFORE doing anything else, call read_file('{Profiler_SKILL}') "
+        "You are a criminal behavioral profiler.\n\n"
+        f"BEFORE doing anything else, call read_file('{PROFILER_SKILL}') "
         "to load your operating instructions, then follow every step exactly.\n\n"
-        "Toolsets available:\n"
-        "  • Filesystem — read_file, list_directory, get_file_info\n"
-        "  • Vision-tools — fetch_image_base64, delegate_image_to_synthesis, "
-        "delegate_to_expert_agent, store_result, utc_now, log_event"
+        "You will be given the ForensicResult produced by the Forensic agent "
+        "(received via A2A) plus the case images/notes. Use the forensic "
+        "findings as evidence for your profile — do not re-derive forensic "
+        "conclusions yourself.\n\n"
+        "Tools available:\n"
+        "  • Filesystem (sandboxed to your own skills folder) — read_file, "
+        "list_directory, get_file_info"
     ),
-    toolsets=[mcp_toolset, filesystem_toolset],  # was mcp_servers= in older pydantic-ai
+    toolsets=[skills_toolset],
     retries=2,
 )
+
+
+async def run_profiler(task_id: str, prompt: str, forensic_result_json: str) -> ProfileAnalysis:
+    """
+    Convenience entry point for direct (non-A2A) use.
+
+    `forensic_result_json` is the ForensicResult produced by the Forensic
+    agent (already returned via A2A by the time this is called).
+    """
+    full_prompt = (
+        f"[task_id={task_id}]\n\n"
+        f"Forensic agent result:\n{forensic_result_json}\n\n"
+        f"{prompt}"
+    )
+    result = await profile_agent.run(full_prompt)
+    return result.output
