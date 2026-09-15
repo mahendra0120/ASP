@@ -3,7 +3,7 @@ forensic_agent.py
 ─────────────────────────────────────────────────────────────────
 Agent 2 in the pipeline — receives the image(s) relevant to the case
 (e.g. the shot(s) showing the body) directly over A2A and produces a
-structured ForensicResult.
+a markdown forensic report.
 
 IMPORTANT — no MCP here on purpose:
 There is no forensic-skill markdown file for this agent to read, so
@@ -11,7 +11,7 @@ it is NOT given the filesystem MCP server, and it does not need the
 vision-tools/A2A-delegation MCP server either — the caller (main.py,
 via the A2A client) is what drives the pipeline and forwards this
 agent's result on to the Profiler agent afterwards. This agent's job
-is only: image(s) in -> ForensicResult out.
+is only: image(s) in -> markdown report out.
 """
 
 import os
@@ -37,40 +37,33 @@ FORENSIC_MODEL_ID = os.getenv(
 )
 
 
-class ForensicResult(BaseModel):
-    """Output of Agent 2 — Forensic Agent."""
-
-    task_id: str
-    executive_summary: str
-    key_insights: list[str] = Field(min_length=1)
-    recommendations: list[str] = Field(min_length=1)
-    seo_tags: list[str] = Field(default_factory=list)
-    accessibility_description: str
-    quality_score: float = Field(ge=0.0, le=10.0)
-    timestamp: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
-
-
 # No toolsets — no MCP servers of any kind are attached to this agent.
-forensic_agent: Agent[None, ForensicResult] = Agent(
+forensic_agent: Agent[None, str] = Agent(
     model=make_model(FORENSIC_MODEL_ID),
-    output_type=ForensicResult,
     system_prompt=(
         "You are a forensic image-analysis agent. You are given one or more "
         "images relevant to a case (for example, images showing a body) and "
         "any accompanying notes.\n\n"
         "You have no tools and no external skill file — analyze only what is "
-        "visible in the image(s) you were given and produce your findings "
-        "directly as the required structured output. Be precise, factual, "
-        "and avoid speculation beyond what the image evidence supports."
+        "visible in the image(s) you were given and write your findings as "
+        "a clear Markdown report. Be precise and factual.\n\n"
+        "CRITICAL — avoid template padding: describe ONLY injuries/findings "
+        "you can actually see. Do NOT assume a symmetric or repeated "
+        "pattern across body regions (e.g. do not report an injury on "
+        "every region just because you found one on some regions). "
+        "Examine each area independently: if a region shows no visible "
+        "injury or finding, either omit it or explicitly say 'no visible "
+        "injury' — never invent one to match a pattern from other "
+        "regions. If a detail isn't clearly visible (exact measurements, "
+        "wound depth, weapon type, etc.), say so explicitly rather than "
+        "guessing a specific-sounding number or detail."
     ),
     toolsets=[],
     retries=2,
 )
 
 
-async def run_forensic_analysis(task_id: str, prompt: str) -> ForensicResult:
+async def run_forensic_analysis(task_id: str, prompt: str) -> str:
     """
     Convenience entry point for direct (non-A2A) use, e.g. from tests.
 

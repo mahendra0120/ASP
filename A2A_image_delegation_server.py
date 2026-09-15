@@ -1,10 +1,33 @@
 import os
 import asyncio
 import uvicorn
+import logging
+import traceback
+from fasta2a.pydantic_ai import _bridge
 from fasta2a.pydantic_ai import agent_to_a2a
 from qwen_agents import profiler_agent, forensic_agent
 
-PROFILER_PORT = int(os.getenv('PROFILER_AGENT_PORT', '8001'))
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+_original_run_task = _bridge.AgentWorker.run_task
+
+async def _debug_run_task(self, params):
+    try:
+        return await _original_run_task(self, params)
+    except Exception:
+        print("=" * 80)
+        print("AGENT TASK EXCEPTION (captured before fasta2a silently swallows it):")
+        traceback.print_exc()
+        print("=" * 80)
+        raise
+
+_bridge.AgentWorker.run_task = _debug_run_task
+
+PROFILER_PORT = int(os.getenv('PROFILER_AGENT_PORT', '8011'))
 FORENSIC_PORT = int(os.getenv('FORENSIC_AGENT_PORT', '8002'))
 
 profiler_app = agent_to_a2a(
@@ -38,14 +61,14 @@ async def run_profiler_server() -> None:
         app = profiler_app, 
         host = "0.0.0.0",
         port = PROFILER_PORT,
-        log_level = "info" )).serve()
+        log_level = "debug" )).serve()
 
 async def run_forensic_server() -> None:
     await uvicorn.Server(uvicorn.Config(
         app = Forensic_app,
         host = "0.0.0.0",
         port = FORENSIC_PORT,
-        log_level = "info")).serve()
+        log_level = "debug")).serve()
 
 async def run_both() -> None:
     await asyncio.gather(

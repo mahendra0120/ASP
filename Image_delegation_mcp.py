@@ -39,13 +39,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 MCP_PORT       = int(os.getenv("MCP_SERVER_PORT",      "9000"))
 SYNTHESIS_PORT = int(os.getenv("SYNTHESIS_AGENT_PORT", "8002"))
 EXPERT_PORT    = int(os.getenv("EXPERT_AGENT_PORT",    "8003"))
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="QwenVL-Vision-Tools",
     instructions=(
         "Vision utilities and A2A delegation tools for Qwen VL agents. "

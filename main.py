@@ -2,10 +2,14 @@
 main_gradio.py - Enhanced with Image Upload + Extra Context
 """
 
+import os
 import asyncio
 import json
+import logging
+import mimetypes
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 import tempfile
@@ -14,6 +18,13 @@ import shutil
 import gradio as gr
 from dotenv import load_dotenv
 from rich.console import Console
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [PIPELINE] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("pipeline")
 
 from A2A_image_delegation_client import (
     A2AMessage, TextPart, ImagePart,
@@ -30,6 +41,19 @@ TEMP_IMAGE_DIR = Path("temp_uploads")
 TEMP_IMAGE_DIR.mkdir(exist_ok=True)
 
 
+def guess_image_media_type(url_or_path: str) -> str:
+    """
+    Best-effort MIME type detection from a filename/URL extension.
+    Falls back to image/jpeg if nothing recognizable is found, since
+    the A2A file part needs a concrete media_type for the receiving
+    agent to correctly classify it as an image.
+    """
+    mime_type, _ = mimetypes.guess_type(url_or_path)
+    if mime_type and mime_type.startswith("image/"):
+        return mime_type
+    return "image/jpeg"
+
+
 # =============================================
 # Server Management (unchanged)
 # =============================================
@@ -41,7 +65,7 @@ def launch_servers():
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         a2a_proc = subprocess.Popen([sys.executable, "A2A_image_delegation_server.py"],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return "✅ Servers started (MCP:9000 | Profiler:8001 | Forensic:8002)"
+        return f"✅ Servers started (MCP:9000 | Profiler:{os.getenv('PROFILER_AGENT_PORT', '8001')} | Forensic:{os.getenv('FORENSIC_AGENT_PORT', '8002')})"
     except Exception as e:
         return f"❌ Server launch failed: {e}"
 
@@ -60,24 +84,34 @@ def stop_servers():
 # Helper: Save uploaded image and return URL
 # =============================================
 
-def save_uploaded_image(image) -> str:
-    """Save uploaded image and return a local URL that the agents can access"""
-    if image is None:
-        return None
-    
-    # Create unique filename
-    temp_path = TEMP_IMAGE_DIR / f"{uuid.uuid4()}_{Path(image.name).name if hasattr(image, 'name') else 'image.jpg'}"
-    shutil.copy(image.name if hasattr(image, 'name') else image, temp_path)
-    
-    # Return local URL (Gradio serves static files from /file=...)
-    return f"http://127.0.0.1:7860/file={temp_path}"
+MAX_IMAGES = 15
+
+
+def save_uploaded_images(images) -> list[str]:
+    """
+    Save one or more uploaded images and return their local URLs.
+    `images` is whatever gr.File(file_count="multiple") hands back —
+    a list of tempfile-like objects (or plain path strings depending
+    on Gradio version). Returns [] if nothing was uploaded.
+    """
+    if not images:
+        return []
+
+    urls = []
+    for image in images:
+        temp_path = TEMP_IMAGE_DIR / f"{uuid.uuid4()}_{Path(image.name).name if hasattr(image, 'name') else 'image.jpg'}"
+        shutil.copy(image.name if hasattr(image, 'name') else image, temp_path)
+        urls.append(f"http://127.0.0.1:7860/gradio_api/file={temp_path}")
+        log.info(f"Image received and saved -> {temp_path.name}")
+
+    return urls
 
 
 # =============================================
 # Pipeline
 # =============================================
 
-async def run_pipeline_async(image_url: str, prompt: str, extra_context: str):
+async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: str):
     try:
         task_id = str(uuid.uuid4())[:8]
 
@@ -88,25 +122,26 @@ async def run_pipeline_async(image_url: str, prompt: str, extra_context: str):
         # 1) The case image(s) (e.g. showing the body) go straight to the
         #    Forensic agent over A2A. It has no MCP/skill access — it just
         #    analyzes what's in front of it.
-        forensic_data = await step_forensic(image_url, full_prompt)
+        forensic_data = await step_forensic(image_urls, full_prompt)
 
         # 2) The Forensic agent's result is then forwarded over A2A to the
         #    Profiler agent, which is the only agent with MCP access
         #    (to its own criminal-behavioral-analysis skill markdown).
-        profiler_data = await step_profiler(image_url, full_prompt, forensic_data)
+        profiler_data = await step_profiler(image_urls, full_prompt, forensic_data)
 
-        final_result = {
-            "task_id": task_id,
-            "forensic": forensic_data,
-            "profiler": profiler_data,
-        }
+        log.info(f"Combining Forensic + Profiler results into final profiling report (task_id={task_id})")
+        final_markdown = (
+            f"# Case {task_id}\n\n"
+            f"## Forensic Analysis\n\n{forensic_data}\n\n"
+            f"## Profiler Analysis\n\n{profiler_data}\n"
+        )
 
-        Path("pipeline_result.json").write_text(json.dumps(final_result, indent=2))
+        Path("pipeline_result.md").write_text(final_markdown)
 
         return (
-            json.dumps(forensic_data, indent=2),
-            json.dumps(profiler_data, indent=2),
-            json.dumps(final_result, indent=2),
+            forensic_data,
+            profiler_data,
+            final_markdown,
             "✅ Pipeline completed successfully!",
         )
     except Exception as e:
@@ -114,46 +149,73 @@ async def run_pipeline_async(image_url: str, prompt: str, extra_context: str):
         return error, error, error, error
 
 
-def run_pipeline(image, image_url, prompt, extra_context):
-    # Prioritize uploaded image over URL
-    final_url = None
-    if image is not None:
-        final_url = save_uploaded_image(image)
-    elif image_url:
-        final_url = image_url.strip()
+def run_pipeline(images, image_url, prompt, extra_context):
+    # Prioritize uploaded images over URL; combine if both given.
+    image_urls: list[str] = []
 
-    if not final_url:
-        return ["❌ Please provide either an image upload or image URL"] * 4
+    if images:
+        if len(images) > MAX_IMAGES:
+            return [f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 4
+        image_urls.extend(save_uploaded_images(images))
+
+    if image_url and image_url.strip():
+        image_urls.append(image_url.strip())
+
+    if not image_urls:
+        return ["❌ Please provide at least one image upload or image URL"] * 4
+
+    if len(image_urls) > MAX_IMAGES:
+        return [f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 4
+
+    log.info(f"Pipeline starting with {len(image_urls)} image(s)")
 
     try:
-        return asyncio.run(run_pipeline_async(final_url, prompt, extra_context))
+        return asyncio.run(run_pipeline_async(image_urls, prompt, extra_context))
     except Exception as e:
         error = f"❌ Critical error: {e}"
         return [error] * 4
 
 
-async def step_forensic(image_url: str, prompt: str):
+async def step_forensic(image_urls: list[str], prompt: str):
     """Send the relevant case image(s) straight to the Forensic agent via A2A."""
+    log.info(f"[1/4] Sending {len(image_urls)} image(s) to Forensic agent")
+    image_parts = [
+        ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
+    ]
+    start = time.monotonic()
     task = await FORENSIC_AGENT.send_task(
-        A2AMessage(parts=[TextPart(prompt), ImagePart(url=image_url)])
+        A2AMessage(parts=[TextPart(prompt), *image_parts])
     )
+    elapsed = time.monotonic() - start
     if task.failed:
+        log.info(f"[1/4] Forensic agent FAILED after {elapsed:.1f}s: {task.error}")
         raise RuntimeError(f"Forensic agent failed: {task.error}")
-    return task.json_output()
+    result = task.output()
+    log.info(f"[2/4] Forensic agent completed in {elapsed:.1f}s ({len(result)} chars) -- forwarding to Profiler via A2A")
+    return result
 
 
-async def step_profiler(image_url: str, prompt: str, forensic_json: dict):
+async def step_profiler(image_urls: list[str], prompt: str, forensic_report: str):
     """Forward the Forensic agent's result (+ original image/notes) to the Profiler agent."""
+    log.info(f"[3/4] Sending {len(image_urls)} image(s) + Forensic result to Profiler agent")
     combined_prompt = (
-        f"{prompt}\n\nForensic agent result (from A2A):\n"
-        f"{json.dumps(forensic_json, indent=2)}"
+        f"{prompt}\n\nForensic agent report (from A2A):\n"
+        f"{forensic_report}"
     )
+    image_parts = [
+        ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
+    ]
+    start = time.monotonic()
     task = await PROFILER_AGENT.send_task(
-        A2AMessage(parts=[TextPart(combined_prompt), ImagePart(url=image_url)])
+        A2AMessage(parts=[TextPart(combined_prompt), *image_parts])
     )
+    elapsed = time.monotonic() - start
     if task.failed:
+        log.info(f"[3/4] Profiler agent FAILED after {elapsed:.1f}s: {task.error}")
         raise RuntimeError(f"Profiler agent failed: {task.error}")
-    return task.json_output()
+    result = task.output()
+    log.info(f"[4/4] Profiler agent completed in {elapsed:.1f}s ({len(result)} chars) -- combining into final profile")
+    return result
 
 # =============================================
 # Gradio UI
@@ -173,8 +235,12 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
         with gr.Column(scale=2):
             gr.Markdown("### Input")
             with gr.Tabs():
-                with gr.Tab("📤 Upload Image"):
-                    image_input = gr.Image(type="filepath", label="Upload Photo")
+                with gr.Tab("📤 Upload Images"):
+                    image_input = gr.File(
+                        file_count="multiple",
+                        file_types=["image"],
+                        label="Upload Photos (max 15)",
+                    )
                 with gr.Tab("🔗 Image URL"):
                     url_input = gr.Textbox(label="Image URL", placeholder="https://...", lines=1)
 
@@ -194,12 +260,12 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
 
     with gr.Row():
         with gr.Column():
-            forensic_out = gr.Code(label="🔬 Forensic Agent (no MCP)", language="json", lines=12)
+            forensic_out = gr.Markdown(label="🔬 Forensic Agent (no MCP)")
         with gr.Column():
-            profiler_out = gr.Code(label="🔍 Profiler Agent (MCP: skills/ only)", language="json", lines=12)
+            profiler_out = gr.Markdown(label="🔍 Profiler Agent (MCP: skills/ only)")
 
     with gr.Accordion("📄 Full Result", open=False):
-        full_out = gr.Code(label="Complete JSON", language="json", lines=15)
+        full_out = gr.Markdown(label="Complete Report")
 
     status_out = gr.Textbox(label="Pipeline Status", interactive=False)
 
@@ -218,4 +284,5 @@ if __name__ == "__main__":
         server_port=7860,
         inbrowser=True,
         theme=gr.themes.Soft(),
+        allowed_paths=[str(TEMP_IMAGE_DIR.resolve())],
     )

@@ -22,6 +22,7 @@ import os
 import json
 import httpx
 import uuid
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -33,6 +34,7 @@ class TextPart:
 
     def to_dict(self) -> dict:
         return {"kind": "text", "text": self.text}
+
 
 @dataclass
 class ImagePart:
@@ -85,6 +87,13 @@ class A2ATask:
         return "\n".join(texts)
 
     def json_output(self) -> Any:
+        # pydantic-ai's typed/structured output comes back as a "data" part,
+        # not "text" — prefer that, falling back to parsing text as JSON.
+        for artifact in self.artifacts:
+            for part in artifact.get("parts", []):
+                if "data" in part:
+                    data = part["data"]
+                    return data.get("result", data) if isinstance(data, dict) else data
         text = self.output()
         return json.loads(text) if text else {}
 
@@ -105,7 +114,10 @@ class A2AClient:
     async def send_task(
         self,
         message: A2AMessage,
-        metadata: Optional[dict] = None) -> A2ATask:
+        metadata: Optional[dict] = None,
+        poll_interval: float = 2.0,
+        max_wait: float = 1800.0,
+    ) -> A2ATask:
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -116,20 +128,44 @@ class A2AClient:
             }
         }
 
-        async with httpx.AsyncClient(timeout = self._timeout) as c:
-            r = await c.post(self.base_url, json = payload, headers = {"Content-Type": "application/json"})
+        async with httpx.AsyncClient(timeout=self._timeout) as c:
+            r = await c.post(self.base_url, json=payload, headers={"Content-Type": "application/json"})
             r.raise_for_status()
             body = r.json()
 
         if "error" in body:
-            return A2ATask(id = message.message_id, state = "failed", error = str(body["error"]))
+            print(f"[A2A:{self.base_url}] send_task error: {body['error']}")
+            return A2ATask(id=message.message_id, state="failed", error=str(body["error"]))
 
         res = body.get("result", {})
-        return A2ATask(
-            id = res.get("id", message.message_id),
-            state = res.get("status", {}).get("state", "unknown"),
-            artifacts = res.get("artifacts", [])
-        )
+        task_id = res.get("id", message.message_id)
+        state = res.get("status", {}).get("state", "unknown")
+        artifacts = res.get("artifacts", [])
+
+        print(f"[A2A:{self.base_url}] task {task_id} -> state={state} (elapsed=0.0s)")
+
+        # message/send only enqueues the task; poll tasks/get until it
+        # reaches a terminal state (completed / failed / rejected / canceled).
+        elapsed = 0.0
+        terminal_states = ("completed", "failed", "rejected", "canceled")
+        while state not in terminal_states and elapsed < max_wait:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            task = await self.get_task(task_id)
+            if task.state != state:
+                print(f"[A2A:{self.base_url}] task {task_id} -> state={task.state} (elapsed={elapsed:.1f}s)")
+            state = task.state
+            artifacts = task.artifacts
+
+        if state not in terminal_states:
+            print(f"[A2A:{self.base_url}] task {task_id} TIMED OUT after {max_wait}s (last state: {state})")
+            return A2ATask(
+                id=task_id, state="failed", artifacts=artifacts,
+                error=f"Task did not complete within {max_wait}s (last state: {state})"
+            )
+
+        print(f"[A2A:{self.base_url}] task {task_id} finished: state={state}, artifacts={len(artifacts)}")
+        return A2ATask(id=task_id, state=state, artifacts=artifacts)
     
     async def get_task(self, task_id: str) -> A2ATask:
         payload = {
@@ -140,11 +176,24 @@ class A2AClient:
         async with httpx.AsyncClient(timeout = 30.0) as c:
             r = await c.post(self.base_url, json = payload)
             r.raise_for_status()
-            res = r.json().get("result", {})
+            full = r.json()
+            res = full.get("result", {})
+
+        state = res.get("status", {}).get("state", "unknown")
+        if state in ("failed", "rejected"):
+            print(f"[A2A:{self.base_url}] RAW FAILED TASK RESPONSE:")
+            print(json.dumps(full, indent=2))
+
+        status_message = res.get("status", {}).get("message")
+        error_text = None
+        if status_message:
+            error_text = json.dumps(status_message)
+
         return A2ATask(
             id = res.get("id", task_id),
-            state = res.get("status", {}).get("state", "unknown"),
-            artifacts = res.get("artifacts", [])
+            state = state,
+            artifacts = res.get("artifacts", []),
+            error = error_text,
         )
 
     async def cancel_task(self, task_id: str) -> bool:
@@ -160,5 +209,5 @@ class A2AClient:
 
 
 
-PROFILER_AGENT = A2AClient(f"http://localhost:{os.getenv('PROFILER_AGENT_PORT', '8001')}")
+PROFILER_AGENT = A2AClient(f"http://localhost:{os.getenv('PROFILER_AGENT_PORT', '8011')}")
 FORENSIC_AGENT = A2AClient(f"http://localhost:{os.getenv('FORENSIC_AGENT_PORT', '8002')}")

@@ -1,0 +1,156 @@
+W0912 09:44:09.573000 10367 .venv/lib/python3.13/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W0912 09:44:09.845000 10367 .venv/lib/python3.13/site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+/workspace/ASP/.venv/lib/python3.13/site-packages/unsloth/__init__.py:1554: UserWarning: WARNING: Unsloth should be imported before [transformers] to ensure all optimizations are applied. Your code may run slower or encounter memory issues without these optimizations.
+
+Please restructure your imports with 'import unsloth' at the top of your file.
+  from ._gpu_init import *
+🦥 Unsloth: Will patch your computer to enable 2x faster free finetuning.
+🦥 Unsloth Zoo will now patch everything to make training faster!
+/workspace/ASP/.venv/lib/python3.13/site-packages/unsloth/import_fixes.py:2124: FutureWarning: torch._dynamo.config.inline_inbuilt_nn_modules is deprecated and does not do anything, inline_inbuilt_nn_modules is always True. It will be removed in a future version of PyTorch.
+  original_setattr(self, name, value)
+INFO:     Started server process [10367]
+INFO:     Waiting for application startup.
+INFO:     Started server process [10367]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8002 (Press CTRL+C to quit)
+Secure MCP Filesystem Server running on stdio
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8011 (Press CTRL+C to quit)
+Client does not support MCP Roots, using allowed directories set from server args: [ '/workspace/ASP/qwen_agents/Profiler_agent/.agents/skills' ]
+INFO:     127.0.0.1:43626 - "POST / HTTP/1.1" 200 OK
+================================================================================
+AGENT TASK EXCEPTION (captured before fasta2a silently swallows it):
+Traceback (most recent call last):
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/utils/_http.py", line 772, in hf_raise_for_status
+    response.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/httpx/_models.py", line 829, in raise_for_status
+    raise HTTPStatusError(message, request=request, response=self)
+httpx.HTTPStatusError: Client error '429 Too Many Requests' for url 'https://huggingface.co/api/models/mahendra0120/Forensic-Agent-4.0-2026-09-08_14.31.12/revision/main'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/_snapshot_download.py", line 245, in snapshot_download
+    repo_info = api.repo_info(repo_id=repo_id, repo_type=repo_type, revision=revision)
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/hf_api.py", line 3621, in repo_info
+    return method(
+        repo_id,
+    ...<4 lines>...
+        files_metadata=files_metadata,
+    )
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/hf_api.py", line 3313, in model_info
+    hf_raise_for_status(r)
+    ~~~~~~~~~~~~~~~~~~~^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/utils/_http.py", line 892, in hf_raise_for_status
+    raise _format(HfHubHTTPError, message, response) from e
+huggingface_hub.errors.HfHubHTTPError: (Amz CF ID: CUlGV6oP8spqaUVgtphXHh-biuDMkv31ldyWd4g-ZceHnyVIVtxIPg==)
+
+429 Too Many Requests for url: https://huggingface.co/api/models/mahendra0120/Forensic-Agent-4.0-2026-09-08_14.31.12/revision/main.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/ASP/A2A_image_delegation_server.py", line 20, in _debug_run_task
+    return await _original_run_task(self, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/fasta2a/pydantic_ai/_bridge.py", line 134, in run_task
+    result = await self.agent.run(message_history=message_history)  # type: ignore
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/agent/abstract.py", line 664, in run
+    node = await agent_run.next(node)  # pyright: ignore[reportArgumentType]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/run.py", line 476, in next
+    return await self._run_node_with_hooks(node, self._stream_and_advance)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/run.py", line 398, in _run_node_with_hooks
+    return await self._wrap_and_advance(run_context, node, step_fn)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/run.py", line 345, in _wrap_and_advance
+    result = await step_fn(node)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/run.py", line 490, in _stream_and_advance
+    return await self._advance_graph(node)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/run.py", line 319, in _advance_graph
+    task = await self._graph_run.next(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_graph/graph_builder.py", line 584, in next
+    return await anext(self)
+           ^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_graph/graph_builder.py", line 561, in __anext__
+    raise self._next.error
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_graph/graph_builder.py", line 860, in _run_tracked_task
+    result = await self._run_task(t_)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_graph/graph_builder.py", line 911, in _run_task
+    output = await node.call(step_context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_graph/step.py", line 253, in _call_node
+    return await node.run(GraphRunContext(state=ctx.state, deps=ctx.deps))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py", line 1173, in run
+    return await self._make_request(ctx)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py", line 1474, in _make_request
+    model_response = await model_handler(request_context)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py", line 1451, in model_handler
+    response = await model_request(
+               ^^^^^^^^^^^^^^^^^^^^
+        req_ctx.model, request_context=req_ctx, run_context=run_context, on_progress=on_progress
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py", line 1034, in model_request
+    new_response = await model.request(
+                   ^^^^^^^^^^^^^^^^^^^^
+        messages, request_context.model_settings, request_context.model_request_parameters
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/models/function.py", line 170, in request
+    result = await _utils.run_in_executor(self.function, messages, agent_info)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_utils.py", line 200, in run_in_executor
+    return await run_sync(call_with_sync_agent_guard, abandon_on_cancel=_abandon_on_cancel.get())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/anyio/to_thread.py", line 63, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/anyio/_backends/_asyncio.py", line 2518, in run_sync_in_worker_thread
+    return await future
+           ^^^^^^^^^^^^
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/anyio/_backends/_asyncio.py", line 1002, in run
+    result = context.run(func, *args)
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/pydantic_ai/_utils.py", line 187, in call_with_sync_agent_guard
+    return func(*args, **kwargs)
+  File "/workspace/ASP/qwen_agents/model_utils.py", line 130, in _run
+    model, processor = _load(model_id, adapter_path, processor_path)
+                       ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/ASP/qwen_agents/model_utils.py", line 70, in _load
+    local_path = _download(model_id)
+  File "/workspace/ASP/qwen_agents/model_utils.py", line 46, in _download
+    return snapshot_download(repo_id=repo_id, token=os.getenv("HF_TOKEN"))
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/utils/_validators.py", line 88, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/workspace/ASP/.venv/lib/python3.13/site-packages/huggingface_hub/_snapshot_download.py", line 329, in snapshot_download
+    raise LocalEntryNotFoundError(
+    ...<4 lines>...
+    ) from api_call_error
+huggingface_hub.errors.LocalEntryNotFoundError: Got: HfHubHTTPError: (Amz CF ID: CUlGV6oP8spqaUVgtphXHh-biuDMkv31ldyWd4g-ZceHnyVIVtxIPg==)
+
+429 Too Many Requests for url: https://huggingface.co/api/models/mahendra0120/Forensic-Agent-4.0-2026-09-08_14.31.12/revision/main.
+An error happened while trying to locate the files on the Hub, and we cannot find the appropriate snapshot folder for the specified revision on the local disk. Please check your internet connection and try again.
+================================================================================
+INFO:     127.0.0.1:43628 - "POST / HTTP/1.1" 200 OK
