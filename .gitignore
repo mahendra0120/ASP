@@ -7,11 +7,15 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
-.env
-.env
 .venv/
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
 .env
+
+# Editor/notebook artifacts
+.ipynb_checkpoints/
+
+# Runtime-generated artifacts (created by running main.py)
+a2a_debug.log
+pipeline_result.json
+pipeline_result.md
+
+temp_uploads/

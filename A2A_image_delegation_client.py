@@ -24,7 +24,7 @@ import httpx
 import uuid
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 #Message Types
 
@@ -71,10 +71,6 @@ class A2ATask:
     error: Optional[str] = None
 
     @property
-    def success(self) -> bool:
-        return self.state == "completed"
-
-    @property
     def failed(self) -> bool:
         return self.state in ("failed", "rejected")
 
@@ -86,17 +82,6 @@ class A2ATask:
                     texts.append(part["text"])
         return "\n".join(texts)
 
-    def json_output(self) -> Any:
-        # pydantic-ai's typed/structured output comes back as a "data" part,
-        # not "text" — prefer that, falling back to parsing text as JSON.
-        for artifact in self.artifacts:
-            for part in artifact.get("parts", []):
-                if "data" in part:
-                    data = part["data"]
-                    return data.get("result", data) if isinstance(data, dict) else data
-        text = self.output()
-        return json.loads(text) if text else {}
-
 
 # A2A HTTP Client
 
@@ -104,12 +89,6 @@ class A2AClient:
     def __init__(self, base_url: str, timeout: float = 120.0):
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
-    
-    async def ag_card(self) -> dict:
-        async with httpx.AsyncClient(timeout = 10.0) as c:
-            r = await c.get(f"{self.base_url}/.well-known/agent.json")
-            r.raise_for_status()
-            return r.json()
 
     async def send_task(
         self,
@@ -195,18 +174,6 @@ class A2AClient:
             artifacts = res.get("artifacts", []),
             error = error_text,
         )
-
-    async def cancel_task(self, task_id: str) -> bool:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": str(uuid.uuid4()),
-            "method": "tasks/cancel",
-            "params": {"id": task_id}
-        }
-        async with httpx.AsyncClient(timeout = 10.0) as c:
-            r = await c.post(self.base_url, json = payload)
-            return r.status_code == 200
-
 
 
 PROFILER_AGENT = A2AClient(f"http://localhost:{os.getenv('PROFILER_AGENT_PORT', '8011')}")

@@ -15,11 +15,9 @@ is only: image(s) in -> markdown report out.
 """
 
 import os
-from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from huggingface_hub import login
-from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from qwen_agents.model_utils import make_model
@@ -56,20 +54,20 @@ forensic_agent: Agent[None, str] = Agent(
         "injury' — never invent one to match a pattern from other "
         "regions. If a detail isn't clearly visible (exact measurements, "
         "wound depth, weapon type, etc.), say so explicitly rather than "
-        "guessing a specific-sounding number or detail."
+        "guessing a specific-sounding number or detail.\n\n"
+        "MANDATORY FINAL SECTION — end every report with exactly this "
+        "heading, verbatim:\n"
+        "## Evidence of Trauma\n"
+        "The first word of this section MUST be either 'Yes' or 'No'.\n"
+        "  - If No: write 'No.' followed by one sentence confirming no "
+        "traumatic findings were observed.\n"
+        "  - If Yes: write 'Yes.' followed by a plain-language list of "
+        "each traumatic finding you described above (e.g. gunshot "
+        "wound, ligature mark, stab wound, contusion, burn) so it can "
+        "be used as a search query against a forensic reference "
+        "knowledge base — do not just say 'see above', restate the "
+        "findings here in your own words."
     ),
     toolsets=[],
     retries=2,
 )
-
-
-async def run_forensic_analysis(task_id: str, prompt: str) -> str:
-    """
-    Convenience entry point for direct (non-A2A) use, e.g. from tests.
-
-    `prompt` should already describe/embed the image(s) to analyze —
-    when served over A2A (see A2A_image_delegation_server.py), the
-    image parts and text sent by the caller are what the agent sees.
-    """
-    result = await forensic_agent.run(f"[task_id={task_id}]\n\n{prompt}")
-    return result.output

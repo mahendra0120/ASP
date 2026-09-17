@@ -29,29 +29,39 @@ skills/rag_retrieval.md) with a CODE-DRIVEN retrieval pipeline: loader →
 splitter → embed → FAISS index → similarity search. The keyword-trigger
 mechanism (check_keyword_triggers) and the A2A delegation to the RAG
 Agent are UNCHANGED — only what happens inside rag_search() changes.
+
+Corpus source: forensic_knowledge/*.md (the case-agnostic forensic
+pathology reference material shipped in this repo — gunshot wounds,
+postmortem changes, thermal injuries, asphyxiation, sharp force injury,
+etc.) is loaded directly, one Document per chunk, tagged with the
+originating filename as `source`. This replaced an earlier
+skills/rag_corpus.json format; that file never actually existed in
+this repo, so this is the corpus's real first implementation, not a
+migration.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# Primary corpus: every markdown file in forensic_knowledge/. Each file
+# is one self-contained topical reference (e.g. Gunshot_wounds.md,
+# asphyxiation.md) — exactly the material a "evidence of trauma" style
+# finding in a Forensic agent report should be grounded against.
+FORENSIC_KNOWLEDGE_DIR = Path(__file__).parent / "forensic_knowledge"
+
+# Legacy/optional: a hand-authored {text, source} JSON corpus, if present,
+# is merged in alongside the forensic_knowledge markdown files. Nothing
+# ships here by default.
 CORPUS_PATH = Path(__file__).parent / "skills" / "rag_corpus.json"
 INDEX_DIR   = Path(__file__).parent / ".octen_faiss_index"
-
-# Octen model -> embedding dimension (informational; FAISS infers this
-# automatically from the first embed_query() call, but useful for sizing
-# memory / sanity-checking config).
-OCTEN_DIMENSIONS = {
-    "Octen/Octen-Embedding-0.6B": 1024,
-    "Octen/Octen-Embedding-4B":   2560,
-    "Octen/Octen-Embedding-8B":   4096,
-}
 
 OCTEN_MODEL_ID = os.getenv("OCTEN_MODEL_ID", "Octen/Octen-Embedding-0.6B")
 
@@ -98,15 +108,44 @@ def build_embeddings(
 #  Corpus loading + chunking
 # ════════════════════════════════════════════════════════════════
 
-def load_corpus_documents(
+def load_forensic_knowledge_documents(
+    knowledge_dir: Path = FORENSIC_KNOWLEDGE_DIR,
+    chunk_size: int = 800,
+    chunk_overlap: int = 100,
+) -> list[Document]:
+    """
+    Load every *.md file under forensic_knowledge/ and split each into
+    LangChain Document chunks, tagged with the source filename (e.g.
+    "Gunshot_wounds.md") so retrieval results can cite which reference
+    a chunk came from.
+    """
+    if not knowledge_dir.exists():
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    docs: list[Document] = []
+    for md_path in sorted(knowledge_dir.glob("*.md")):
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+        if not text.strip():
+            continue
+        for chunk in splitter.split_text(text):
+            docs.append(Document(page_content=chunk, metadata={"source": md_path.name}))
+    return docs
+
+
+def load_json_corpus_documents(
     corpus_path: Path = CORPUS_PATH,
     chunk_size: int = 800,
     chunk_overlap: int = 100,
 ) -> list[Document]:
     """
-    Load skills/rag_corpus.json ({text, source} objects) and split into
-    LangChain Document chunks. Same corpus file format as the previous
-    TF-IDF implementation — no migration needed.
+    Optional legacy corpus: {text, source} objects from a JSON file, if
+    one has been placed at skills/rag_corpus.json. Not required — the
+    forensic_knowledge/*.md files are the real corpus.
     """
     if not corpus_path.exists():
         return []
@@ -126,6 +165,23 @@ def load_corpus_documents(
     return docs
 
 
+def load_corpus_documents(
+    chunk_size: int = 800,
+    chunk_overlap: int = 100,
+) -> list[Document]:
+    """
+    Full corpus: forensic_knowledge/*.md (primary) + skills/rag_corpus.json
+    (optional extra, if present). This is what get_vectorstore() indexes.
+    """
+    docs = load_forensic_knowledge_documents(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+    )
+    docs += load_json_corpus_documents(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+    )
+    return docs
+
+
 # ════════════════════════════════════════════════════════════════
 #  Vector store — built once, cached on disk, reused across calls
 # ════════════════════════════════════════════════════════════════
@@ -138,8 +194,9 @@ def get_vectorstore(
     force_rebuild: bool = False,
 ):
     """
-    Return the FAISS vector store, building it from rag_corpus.json on
-    first call (or loading a cached index from disk if present).
+    Return the FAISS vector store, building it from forensic_knowledge/*.md
+    (+ optional skills/rag_corpus.json) on first call, or loading a
+    cached index from disk if present.
 
     Note: FAISS.save_local / load_local pickle metadata — only load
     indexes you built yourself, never an index from an untrusted source.
@@ -172,8 +229,8 @@ def get_vectorstore(
 
 
 def rebuild_index(embeddings=None) -> None:
-    """Force a full re-embed + re-index of rag_corpus.json. Call this
-    after editing the corpus file."""
+    """Force a full re-embed + re-index of the corpus (forensic_knowledge/*.md
+    + optional skills/rag_corpus.json). Call this after editing either."""
     import shutil
     if INDEX_DIR.exists():
         shutil.rmtree(INDEX_DIR)
@@ -214,7 +271,298 @@ def query(text: str, top_k: int = 5) -> dict:
     return {"results": results, "corpus_size": corpus_size}
 
 
+# ════════════════════════════════════════════════════════════════
+#  Keyword trigger — shared logic
+#
+#  Same case-insensitive, whole-phrase matching used by
+#  Image_delegation_mcp.check_keyword_triggers (the Profiler agent's
+#  MCP tool). Kept here as a plain function (not an @mcp.tool) so it
+#  can be called directly from anywhere — including the orchestrator
+#  in main.py, which drives the Forensic agent and has no MCP client
+#  of its own by design (the Forensic agent is deliberately tool-less).
+# ════════════════════════════════════════════════════════════════
+
+# Trigger vocabulary, organized by the forensic_knowledge/*.md category it
+# maps to. A real Forensic agent report is far more likely to describe a
+# SPECIFIC finding ("entrance wound", "ligature mark", "stab wound") than
+# to use the literal word "trauma" — so each category lists the concrete
+# terms a report would actually use, not just its file name. Flattened
+# into TRAUMA_TRIGGER_KEYWORDS below for the actual scan.
+TRAUMA_KEYWORD_CATEGORIES: dict[str, list[str]] = {
+    # General / catch-all phrasing
+    "general": [
+        "evidence of trauma",
+        "trauma",
+        "traumatic injury",
+        "signs of trauma",
+        "penetrating trauma",
+    ],
+    # -> Gunshot_wounds.md
+    "gunshot": [
+        "gunshot wound",
+        "gunshot",
+        "bullet wound",
+        "bullet hole",
+        "entrance wound",
+        "exit wound",
+        "firearm injury",
+        "projectile wound",
+        "powder stippling",
+        "muzzle imprint",
+    ],
+    # -> sharp_force_injury.md
+    "sharp_force": [
+        "sharp force injury",
+        "sharp force trauma",
+        "stab wound",
+        "incised wound",
+        "incision wound",
+        "puncture wound",
+        "cut wound",
+        "laceration",
+        "chop wound",
+    ],
+    # -> asphyxiation.md
+    "asphyxia": [
+        "asphyxia",
+        "asphyxiation",
+        "asphyxial",
+        "strangulation",
+        "ligature mark",
+        "ligature furrow",
+        "ligature",
+        "petechial hemorrhage",
+        "petechiae",
+        "hanging",
+        "smothering",
+        "suffocation",
+        "manual strangulation",
+    ],
+    # -> Thermal_injuries.md
+    "thermal": [
+        "thermal injury",
+        "burn injury",
+        "burns",
+        "charring",
+        "scald",
+        "fire-related death",
+        "smoke inhalation",
+    ],
+    # -> forensic_stuff.md / forensic_stuff2.md (blunt force trauma)
+    "blunt_force": [
+        "blunt force trauma",
+        "blunt force injury",
+        "blunt trauma",
+        "contusion",
+        "abrasion",
+        "hematoma",
+        "fracture",
+        "crush injury",
+    ],
+    # -> Postmortem_changes.md / Sudden_Natural_Death.md
+    "postmortem_and_natural": [
+        "postmortem change",
+        "livor mortis",
+        "rigor mortis",
+        "algor mortis",
+        "decomposition",
+        "sudden natural death",
+    ],
+}
+
+TRAUMA_TRIGGER_KEYWORDS: list[str] = [
+    kw for kws in TRAUMA_KEYWORD_CATEGORIES.values() for kw in kws
+]
+
+
+EVIDENCE_OF_TRAUMA_HEADING_RE = re.compile(
+    r"^#{1,6}\s*evidence of trauma\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_evidence_of_trauma_section(report: str) -> Optional[str]:
+    """
+    Pull out the body of the Forensic agent's mandatory
+    '## Evidence of Trauma' section (see forensic_agent.py's system
+    prompt), i.e. everything after that heading up to the next
+    heading or end of text.
+
+    Returns None if no such heading is found at all, so the caller
+    can fall back to keyword scanning (e.g. the model ignored the
+    formatting instruction).
+    """
+    match = EVIDENCE_OF_TRAUMA_HEADING_RE.search(report)
+    if not match:
+        return None
+
+    start = match.end()
+    rest = report[start:]
+    next_heading = re.search(r"^#{1,6}\s+\S", rest, re.MULTILINE)
+    end = start + next_heading.start() if next_heading else len(report)
+    return report[start:end].strip()
+
+
+def section_says_yes(section_text: str) -> bool:
+    """
+    True if the Evidence of Trauma section opens with an affirmative
+    ("Yes"), false if it opens with a negative ("No"/"None"/"Negative").
+    Defaults to False (safer to under-trigger than mis-trigger) if the
+    section doesn't clearly start with either.
+    """
+    first_word = section_text.strip().split(None, 1)[0].strip(".:,").lower() if section_text.strip() else ""
+    return first_word == "yes"
+
+
+def check_keyword_trigger(text: str, keywords: list[str] | None = None) -> dict:
+    """
+    Scan `text`, sentence by sentence, for any of `keywords` (case-
+    insensitive; a trailing "s" is tolerated so "stab wound" also
+    matches "stab wounds").
+
+    Negation-aware: a match immediately preceded by a negation cue in
+    the same sentence ("no evidence of trauma", "denies ligature
+    marks", "without burns") is NOT counted as triggering — a report
+    explicitly ruling something out shouldn't pull in reference
+    material for it.
+
+    Returns:
+        {
+          triggered:         bool,
+          matched_keywords:  [kw, ...]         (de-duplicated, in first-seen order)
+          matched_sentences: [sentence, ...]    (de-duplicated, in order)
+          checked_keywords:  the full keyword list that was checked
+        }
+    """
+    kws = keywords or TRAUMA_TRIGGER_KEYWORDS
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+
+    matched_keywords: list[str] = []
+    matched_sentences: list[str] = []
+
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        for kw in kws:
+            pattern = rf"\b{re.escape(kw.lower())}s?\b"
+            for m in re.finditer(pattern, sentence_lower):
+                if _is_negated_before(sentence_lower, m.start()):
+                    continue
+                if kw not in matched_keywords:
+                    matched_keywords.append(kw)
+                if sentence not in matched_sentences:
+                    matched_sentences.append(sentence)
+                break  # one hit per keyword per sentence is enough
+
+    return {
+        "triggered": bool(matched_keywords),
+        "matched_keywords": matched_keywords,
+        "matched_sentences": matched_sentences,
+        "checked_keywords": kws,
+    }
+
+
+_NEGATION_CUES_RE = re.compile(
+    r"\b(no|not|without|absence of|negative for|denies|denied|"
+    r"ruled out|free of|excludes?|unremarkable for)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_negated_before(sentence_lower: str, match_start: int, window_chars: int = 40) -> bool:
+    """True if a negation cue appears in the `window_chars` immediately
+    preceding the match within the same sentence (e.g. "no ... trauma",
+    "denies ... ligature marks")."""
+    preceding = sentence_lower[max(0, match_start - window_chars):match_start]
+    return bool(_NEGATION_CUES_RE.search(preceding))
+
+
+def extract_trigger_context(text: str, matched_keywords: list[str], window: int = 1) -> str:
+    """
+    Pull out the sentence(s) containing any matched (non-negated)
+    keyword, plus `window` sentences of surrounding context on each
+    side, to use as a focused retrieval query instead of the whole
+    report. Falls back to the full text if sentence splitting finds no
+    matches (shouldn't happen if matched_keywords came from
+    check_keyword_trigger on the same text).
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    hit_indices = set()
+    for i, sentence in enumerate(sentences):
+        sentence_lower = sentence.lower()
+        for kw in matched_keywords:
+            pattern = rf"\b{re.escape(kw.lower())}s?\b"
+            for m in re.finditer(pattern, sentence_lower):
+                if not _is_negated_before(sentence_lower, m.start()):
+                    hit_indices.update(range(max(0, i - window), min(len(sentences), i + window + 1)))
+                    break
+
+    if not hit_indices:
+        return text
+
+    return " ".join(sentences[i] for i in sorted(hit_indices))
+
+
+def check_trauma_and_retrieve(text: str, top_k: int = 5) -> dict:
+    """
+    One-shot helper for the orchestrator: decide whether the Forensic
+    agent's report shows evidence of trauma for THIS case, and if so,
+    immediately run the Octen/FAISS similarity search against
+    forensic_knowledge/ to fetch grounding reference material.
+
+    Primary mechanism: the Forensic agent's system prompt requires it
+    to end every report with a "## Evidence of Trauma" section whose
+    first word is literally "Yes" or "No". We just read that — no
+    keyword list needed, because the model already states its own
+    finding for the specific case, in its own words, and those words
+    (whatever they are — "gunshot wound", "ligature mark", a term we
+    never anticipated) become the retrieval query directly. Semantic
+    (embedding) search doesn't require us to guess the model's exact
+    phrasing up front; it only needs a query string, and the "Yes"
+    section IS that query.
+
+    Fallback: if that section is missing (the model ignored the
+    instruction, or this is running against an older report), fall
+    back to scanning the whole report for TRAUMA_TRIGGER_KEYWORDS —
+    a safety net, not the primary path.
+
+    Returns:
+        {
+          "triggered": bool,
+          "source": "evidence_of_trauma_section" | "keyword_fallback",
+          "matched_keywords": [...],      # [] when source is the section
+          "query": str | None,            # what was searched, if triggered
+          "results": [{"text","source","score"}, ...],  # [] if not triggered
+          "corpus_size": int,
+        }
+    """
+    section = extract_evidence_of_trauma_section(text)
+
+    if section is not None:
+        triggered = section_says_yes(section)
+        if not triggered:
+            return {
+                "triggered": False, "source": "evidence_of_trauma_section",
+                "matched_keywords": [], "checked_keywords": [],
+                "query": None, "results": [], "corpus_size": 0,
+            }
+        retrieval = query(section, top_k=top_k)
+        return {
+            "triggered": True, "source": "evidence_of_trauma_section",
+            "matched_keywords": [], "checked_keywords": [],
+            "query": section, **retrieval,
+        }
+
+    # Fallback: no "## Evidence of Trauma" section found in the report.
+    trigger = check_keyword_trigger(text, TRAUMA_TRIGGER_KEYWORDS)
+    if not trigger["triggered"]:
+        return {**trigger, "source": "keyword_fallback", "query": None, "results": [], "corpus_size": 0}
+
+    search_query = extract_trigger_context(text, trigger["matched_keywords"])
+    retrieval = query(search_query, top_k=top_k)
+    return {**trigger, "source": "keyword_fallback", "query": search_query, **retrieval}
+
+
 if __name__ == "__main__":
-    print(f"Building index from {CORPUS_PATH} using {OCTEN_MODEL_ID} ...")
+    print(f"Building index from {FORENSIC_KNOWLEDGE_DIR} using {OCTEN_MODEL_ID} ...")
     rebuild_index()
     print("Done. Try: python -c \"from octen_rag import query; print(query('test'))\"")

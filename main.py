@@ -4,7 +4,6 @@ main_gradio.py - Enhanced with Image Upload + Extra Context
 
 import os
 import asyncio
-import json
 import logging
 import mimetypes
 import subprocess
@@ -12,12 +11,10 @@ import sys
 import time
 import uuid
 from pathlib import Path
-import tempfile
 import shutil
 
 import gradio as gr
 from dotenv import load_dotenv
-from rich.console import Console
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,9 +27,9 @@ from A2A_image_delegation_client import (
     A2AMessage, TextPart, ImagePart,
     PROFILER_AGENT, FORENSIC_AGENT,
 )
+import octen_rag
 
 load_dotenv()
-console = Console()
 
 # Global variables
 mcp_proc = None
@@ -65,13 +62,12 @@ def launch_servers():
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         a2a_proc = subprocess.Popen([sys.executable, "A2A_image_delegation_server.py"],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return f"✅ Servers started (MCP:9000 | Profiler:{os.getenv('PROFILER_AGENT_PORT', '8001')} | Forensic:{os.getenv('FORENSIC_AGENT_PORT', '8002')})"
+        return f"✅ Servers started (MCP:9000 | Profiler:{os.getenv('PROFILER_AGENT_PORT', '8011')} | Forensic:{os.getenv('FORENSIC_AGENT_PORT', '8002')})"
     except Exception as e:
         return f"❌ Server launch failed: {e}"
 
 
 def stop_servers():
-    global mcp_proc, a2a_proc
     for proc in (mcp_proc, a2a_proc):
         if proc:
             proc.terminate()
@@ -124,29 +120,46 @@ async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: 
         #    analyzes what's in front of it.
         forensic_data = await step_forensic(image_urls, full_prompt)
 
-        # 2) The Forensic agent's result is then forwarded over A2A to the
-        #    Profiler agent, which is the only agent with MCP access
-        #    (to its own criminal-behavioral-analysis skill markdown).
-        profiler_data = await step_profiler(image_urls, full_prompt, forensic_data)
+        # 1.5) The Forensic agent has no tools of its own by design, so the
+        #      orchestrator (here) is what watches its report for evidence
+        #      of trauma and, if found, fires up the RAG pipeline against
+        #      forensic_knowledge/ to ground the finding in reference
+        #      material before the Profiler agent ever sees it.
+        rag_data = await step_forensic_rag(task_id, forensic_data)
 
-        log.info(f"Combining Forensic + Profiler results into final profiling report (task_id={task_id})")
-        final_markdown = (
-            f"# Case {task_id}\n\n"
-            f"## Forensic Analysis\n\n{forensic_data}\n\n"
-            f"## Profiler Analysis\n\n{profiler_data}\n"
-        )
+        # 2) The Forensic agent's result (plus any RAG grounding) is then
+        #    forwarded over A2A to the Profiler agent, which is the only
+        #    agent with MCP access (to its own criminal-behavioral-analysis
+        #    skill markdown).
+        profiler_data = await step_profiler(image_urls, full_prompt, forensic_data, rag_data)
+
+        log.info(f"Combining Forensic + RAG + Profiler results into final profiling report (task_id={task_id})")
+        sections = [
+            f"# Case {task_id}",
+            f"## Forensic Analysis\n\n{forensic_data}",
+        ]
+        if rag_data["triggered"]:
+            sections.append(f"## Forensic Knowledge Base Grounding (RAG)\n\n{format_rag_section(rag_data)}")
+        sections.append(f"## Profiler Analysis\n\n{profiler_data}")
+        final_markdown = "\n\n".join(sections) + "\n"
 
         Path("pipeline_result.md").write_text(final_markdown)
+
+        rag_out_text = (
+            format_rag_section(rag_data) if rag_data["triggered"]
+            else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
+        )
 
         return (
             forensic_data,
             profiler_data,
+            rag_out_text,
             final_markdown,
             "✅ Pipeline completed successfully!",
         )
     except Exception as e:
         error = f"❌ {str(e)}"
-        return error, error, error, error
+        return error, error, error, error, error
 
 
 def run_pipeline(images, image_url, prompt, extra_context):
@@ -155,17 +168,17 @@ def run_pipeline(images, image_url, prompt, extra_context):
 
     if images:
         if len(images) > MAX_IMAGES:
-            return [f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 4
+            return [f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5
         image_urls.extend(save_uploaded_images(images))
 
     if image_url and image_url.strip():
         image_urls.append(image_url.strip())
 
     if not image_urls:
-        return ["❌ Please provide at least one image upload or image URL"] * 4
+        return ["❌ Please provide at least one image upload or image URL"] * 5
 
     if len(image_urls) > MAX_IMAGES:
-        return [f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 4
+        return [f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 5
 
     log.info(f"Pipeline starting with {len(image_urls)} image(s)")
 
@@ -173,7 +186,7 @@ def run_pipeline(images, image_url, prompt, extra_context):
         return asyncio.run(run_pipeline_async(image_urls, prompt, extra_context))
     except Exception as e:
         error = f"❌ Critical error: {e}"
-        return [error] * 4
+        return [error] * 5
 
 
 async def step_forensic(image_urls: list[str], prompt: str):
@@ -195,13 +208,76 @@ async def step_forensic(image_urls: list[str], prompt: str):
     return result
 
 
-async def step_profiler(image_urls: list[str], prompt: str, forensic_report: str):
-    """Forward the Forensic agent's result (+ original image/notes) to the Profiler agent."""
+async def step_forensic_rag(task_id: str, forensic_report: str) -> dict:
+    """
+    Check the Forensic agent's report for evidence of trauma and, if
+    found, run the Octen/FAISS RAG pipeline against forensic_knowledge/
+    to fetch grounding reference material.
+
+    This is where the "RAG pipeline starts up" trigger lives: the Forensic
+    agent is deliberately tool-less (see forensic_agent.py), so this check
+    happens here in the orchestrator, right after its report comes back
+    and before it's forwarded to the Profiler agent.
+
+    The trigger itself is just reading the report's own mandatory
+    "## Evidence of Trauma" section (Yes/No) — see
+    octen_rag.check_trauma_and_retrieve for the fallback keyword scan
+    used only if that section is missing.
+
+    Returns the dict shape from octen_rag.check_trauma_and_retrieve:
+        {triggered, source, matched_keywords, query, results, corpus_size}
+    """
+    log.info(f"[RAG] Reading Forensic report's 'Evidence of Trauma' section (task_id={task_id})")
+    # Embedding + FAISS calls are blocking (sentence-transformers), so run
+    # off the event loop rather than stalling the async pipeline.
+    rag_data = await asyncio.to_thread(octen_rag.check_trauma_and_retrieve, forensic_report)
+
+    if rag_data["triggered"]:
+        log.info(
+            f"[RAG] Triggered via {rag_data['source']} -> "
+            f"fetched {len(rag_data['results'])} chunk(s) from forensic_knowledge/ "
+            f"(corpus_size={rag_data['corpus_size']}, task_id={task_id})"
+        )
+    else:
+        log.info(f"[RAG] No evidence of trauma reported — RAG pipeline not triggered (task_id={task_id})")
+
+    return rag_data
+
+
+def format_rag_section(rag_data: dict) -> str:
+    """Render RAG grounding results as a Markdown section."""
+    if not rag_data["triggered"]:
+        return "_Not triggered — Forensic report's 'Evidence of Trauma' section said No._"
+
+    lines = []
+    if rag_data.get("source") == "evidence_of_trauma_section":
+        lines.append("**Triggered by:** Forensic report's 'Evidence of Trauma' section (Yes)")
+    else:
+        lines.append(f"**Triggered by (fallback keyword scan):** {', '.join(rag_data['matched_keywords'])}")
+    lines.append(f"**Retrieval query:** {rag_data['query']}")
+    lines.append("")
+    for i, r in enumerate(rag_data["results"], start=1):
+        lines.append(f"**{i}. {r['source']}** (score: {r['score']})\n\n> {r['text']}\n")
+    return "\n".join(lines)
+
+
+async def step_profiler(image_urls: list[str], prompt: str, forensic_report: str, rag_data: dict | None = None):
+    """Forward the Forensic agent's result (+ original image/notes, + any RAG grounding) to the Profiler agent."""
     log.info(f"[3/4] Sending {len(image_urls)} image(s) + Forensic result to Profiler agent")
     combined_prompt = (
         f"{prompt}\n\nForensic agent report (from A2A):\n"
         f"{forensic_report}"
     )
+    if rag_data and rag_data.get("triggered"):
+        trigger_desc = (
+            "its Evidence of Trauma section" if rag_data.get("source") == "evidence_of_trauma_section"
+            else f"keyword fallback match: {', '.join(rag_data['matched_keywords'])}"
+        )
+        combined_prompt += (
+            f"\n\nGrounded reference material (from forensic_knowledge/, retrieved because "
+            f"the Forensic report's {trigger_desc}):\n"
+            f"{format_rag_section(rag_data)}"
+        )
     image_parts = [
         ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
     ]
@@ -264,6 +340,9 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
         with gr.Column():
             profiler_out = gr.Markdown(label="🔍 Profiler Agent (MCP: skills/ only)")
 
+    gr.Markdown("### 📚 RAG Grounding (triggered by evidence-of-trauma language in the Forensic report)")
+    rag_out = gr.Markdown(label="Forensic Knowledge Base Grounding")
+
     with gr.Accordion("📄 Full Result", open=False):
         full_out = gr.Markdown(label="Complete Report")
 
@@ -273,7 +352,7 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
     run_btn.click(
         fn=run_pipeline,
         inputs=[image_input, url_input, prompt, extra_context],
-        outputs=[forensic_out, profiler_out, full_out, status_out],
+        outputs=[forensic_out, profiler_out, rag_out, full_out, status_out],
     )
 
     gr.Markdown("**Tip:** You can upload an image **and** add extra context text.")

@@ -13,13 +13,10 @@ has no skill file, so it gets no MCP at all (see forensic_agent.py).
 """
 
 import os
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from huggingface_hub import login
-from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
 from fastmcp.client import Client as FastMCPClient
@@ -154,19 +151,3 @@ profile_agent: Agent[None, str] = Agent(
     toolsets=[skills_toolset],
     retries=2,
 )
-
-
-async def run_profiler(task_id: str, prompt: str, forensic_result_json: str) -> str:
-    """
-    Convenience entry point for direct (non-A2A) use.
-
-    `forensic_result_json` is the ForensicResult produced by the Forensic
-    agent (already returned via A2A by the time this is called).
-    """
-    full_prompt = (
-        f"[task_id={task_id}]\n\n"
-        f"Forensic agent result:\n{forensic_result_json}\n\n"
-        f"{prompt}"
-    )
-    result = await profile_agent.run(full_prompt)
-    return result.output

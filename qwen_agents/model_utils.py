@@ -31,7 +31,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-import torch
 from dotenv import load_dotenv
 from huggingface_hub import snapshot_download
 from transformers import AutoProcessor

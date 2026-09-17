@@ -43,8 +43,7 @@ profiler_app = agent_to_a2a(
 )
 
 
-
-Forensic_app = agent_to_a2a(
+forensic_app = agent_to_a2a(
     forensic_agent,
     name = "Forensic agent",
     description = (
@@ -65,7 +64,7 @@ async def run_profiler_server() -> None:
 
 async def run_forensic_server() -> None:
     await uvicorn.Server(uvicorn.Config(
-        app = Forensic_app,
+        app = forensic_app,
         host = "0.0.0.0",
         port = FORENSIC_PORT,
         log_level = "debug")).serve()

@@ -19,8 +19,8 @@ Skill files are read via the standard MCP filesystem server
 Agents call read_file() on that server for their instructions.
 
 Tools:
-  delegate_image_to_synthesis  — Agent 1 → Agent 2 via A2A
-  delegate_to_expert_agent     — any agent → Agent 3 via A2A
+  delegate_to_profiler_agent   — any agent → Profiler agent via A2A
+  delegate_to_forensic_agent   — any agent → Forensic agent via A2A
   fetch_image_base64           — URL → base64 bytes
   store_result                 — write to shared in-memory store
   get_result                   — read from shared in-memory store
@@ -41,9 +41,9 @@ from typing import Any
 import httpx
 from mcp.server.mcpserver import MCPServer
 
-MCP_PORT       = int(os.getenv("MCP_SERVER_PORT",      "9000"))
-SYNTHESIS_PORT = int(os.getenv("SYNTHESIS_AGENT_PORT", "8002"))
-EXPERT_PORT    = int(os.getenv("EXPERT_AGENT_PORT",    "8003"))
+MCP_PORT      = int(os.getenv("MCP_SERVER_PORT",      "9000"))
+PROFILER_PORT = int(os.getenv('PROFILER_AGENT_PORT', '8011'))
+FORENSIC_PORT = int(os.getenv('FORENSIC_AGENT_PORT', '8002'))
 
 mcp = MCPServer(
     name="QwenVL-Vision-Tools",
@@ -117,40 +117,42 @@ def _extract_data_or_text(result: dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-#  Tool 1 — Agent 1 → Agent 2 (Synthesis)
+#  Tool 1 — any agent → Profiler agent
 # ════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def delegate_image_to_synthesis(
+async def delegate_to_profiler_agent(
     task_id: str,
     image_url: str,
     visual_analysis: str,
     reason: str,
 ) -> dict:
     """
-    Forward image + VisualAnalysis JSON to the Synthesis Agent via A2A.
+    Forward image + analysis to the Profiler agent via A2A.
 
-    Call this after visual analysis when the skill file's delegation
-    rules say to proceed. The MCP server makes the HTTP call — the
-    model never constructs requests itself.
+    The MCP server makes the HTTP call — the model never constructs
+    requests itself. Note: the standard pipeline (main.py) already
+    drives Forensic → Profiler directly via A2AClient, so this tool
+    is only needed for an agent that isn't already receiving the
+    Profiler's result through that orchestration.
 
     Args:
         task_id:         Correlation ID (passed via metadata; A2A
                           generates its own task id server-side).
         image_url:        Original image URL (not base64).
-        visual_analysis: Agent 1's VisualAnalysis as a JSON string.
+        visual_analysis: Prior analysis JSON/text to forward.
         reason:          One sentence explaining why delegating.
 
     Returns:
-        delegated, synthesis_result (JSON string), a2a_task_id, or error.
+        delegated, profiler_result (JSON string), a2a_task_id, or error.
     """
     parts = [
         {
             "kind": "text",
             "text": (
-                f"[Auto-delegated by Visual Analyzer — {reason}]\n\n"
+                f"[Auto-delegated — {reason}]\n\n"
                 f"Original image URL: {image_url}\n\n"
-                f"VisualAnalysis JSON:\n{visual_analysis}"
+                f"Prior analysis:\n{visual_analysis}"
             ),
         },
         {"kind": "file", "file": {"uri": image_url}},
@@ -158,9 +160,9 @@ async def delegate_image_to_synthesis(
 
     try:
         body = await _a2a_send_message(
-            url=f"http://localhost:{SYNTHESIS_PORT}",
+            url=f"http://localhost:{PROFILER_PORT}",
             parts=parts,
-            metadata={"delegated_by": "visual_analyzer", "parent_task_id": task_id},
+            metadata={"delegated_by": "mcp_tool", "parent_task_id": task_id},
         )
     except httpx.HTTPError as exc:
         return {"delegated": False, "error": str(exc)}
@@ -170,44 +172,46 @@ async def delegate_image_to_synthesis(
 
     result = body.get("result", {})
     return {
-        "delegated":        True,
-        "a2a_task_id":      result.get("id", ""),
-        "synthesis_result": _extract_data_or_text(result),
-        "state":            result.get("status", {}).get("state", "unknown"),
+        "delegated":       True,
+        "a2a_task_id":     result.get("id", ""),
+        "profiler_result": _extract_data_or_text(result),
+        "state":           result.get("status", {}).get("state", "unknown"),
     }
 
 
 # ════════════════════════════════════════════════════════════════
-#  Tool 2 — Any agent → Agent 3 (Domain Expert)
+#  Tool 2 — any agent → Forensic agent
 # ════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def delegate_to_expert_agent(
+async def delegate_to_forensic_agent(
     task_id: str,
     image_url: str,
     context_json: str,
     reason: str,
 ) -> dict:
     """
-    Forward an image + prior context to the Domain Expert Agent via A2A.
+    Forward an image + prior context to the Forensic agent via A2A.
 
-    Call this when domain-specific deep analysis is needed (e.g. low
-    confidence, domain-relevant context_category, explicit user request).
+    Note: the standard pipeline (main.py) already sends case images to
+    the Forensic agent directly via A2AClient. This tool exists for
+    an agent that needs to delegate to the Forensic agent outside
+    that orchestration (e.g. a follow-up request mid-conversation).
 
     Args:
         task_id:      Correlation ID (passed via metadata).
         image_url:    Original image URL (not base64).
-        context_json: Prior VisualAnalysis / SynthesisResult JSON, or "{}".
+        context_json: Prior analysis JSON, or "{}".
         reason:       One sentence explaining why delegating.
 
     Returns:
-        delegated, expert_result (JSON string), a2a_task_id, or error.
+        delegated, forensic_result (JSON string), a2a_task_id, or error.
     """
     parts = [
         {
             "kind": "text",
             "text": (
-                f"[Delegated to Domain Expert — {reason}]\n\n"
+                f"[Delegated to Forensic agent — {reason}]\n\n"
                 f"image_url={image_url}\n\n"
                 f"Prior context:\n{context_json}"
             ),
@@ -217,9 +221,9 @@ async def delegate_to_expert_agent(
 
     try:
         body = await _a2a_send_message(
-            url=f"http://localhost:{EXPERT_PORT}",
+            url=f"http://localhost:{FORENSIC_PORT}",
             parts=parts,
-            metadata={"delegated_by": "orchestrator", "parent_task_id": task_id},
+            metadata={"delegated_by": "mcp_tool", "parent_task_id": task_id},
         )
     except httpx.HTTPError as exc:
         return {"delegated": False, "error": str(exc)}
@@ -229,10 +233,10 @@ async def delegate_to_expert_agent(
 
     result = body.get("result", {})
     return {
-        "delegated":     True,
-        "a2a_task_id":   result.get("id", ""),
-        "expert_result": _extract_data_or_text(result),
-        "state":         result.get("status", {}).get("state", "unknown"),
+        "delegated":      True,
+        "a2a_task_id":    result.get("id", ""),
+        "forensic_result": _extract_data_or_text(result),
+        "state":          result.get("status", {}).get("state", "unknown"),
     }
 
 
@@ -327,12 +331,11 @@ if __name__ == "__main__":
 # ════════════════════════════════════════════════════════════════
 #  Tool 9 — Keyword trigger scanner
 #
-#  Used by the Profiler Agent (= domain_expert_agent — it already
-#  profiles visual content) to decide whether its own result text
-#  warrants escalation to the RAG Agent for grounded knowledge.
+#  Used by the Profiler Agent to decide whether its own result text
+#  warrants a rag_search call for grounded knowledge.
 # ════════════════════════════════════════════════════════════════
 
-import re as _re
+import octen_rag as _octen_rag  # shared keyword-trigger + RAG logic
 
 DEFAULT_TRIGGER_KEYWORDS = ["cause", "manner"]
 
@@ -347,12 +350,16 @@ async def check_keyword_triggers(
 
     Call this on your own result text (e.g. overall_assessment +
     expert_notes + findings descriptions joined together) right before
-    returning, to decide whether to escalate to the RAG Agent.
+    returning, to decide whether to call rag_search.
 
     Args:
         text:     Text to scan, e.g. your draft overall_assessment.
         keywords: Override the default trigger list. Defaults to
-                  ["cause", "manner"] if omitted.
+                  ["cause", "manner"] if omitted. Pass
+                  octen_rag.TRAUMA_TRIGGER_KEYWORDS to check for
+                  evidence-of-trauma language instead (this is what the
+                  Forensic→RAG orchestration in main.py checks for,
+                  since the Forensic agent itself has no MCP tools).
 
     Returns:
         dict:
@@ -360,17 +367,7 @@ async def check_keyword_triggers(
           matched_keywords  — list of keywords that matched
           checked_keywords — the full keyword list that was checked
     """
-    kws = keywords or DEFAULT_TRIGGER_KEYWORDS
-    text_lower = text.lower()
-    matched = [
-        kw for kw in kws
-        if _re.search(rf"\b{_re.escape(kw.lower())}\b", text_lower)
-    ]
-    return {
-        "triggered":        bool(matched),
-        "matched_keywords":  matched,
-        "checked_keywords": kws,
-    }
+    return _octen_rag.check_keyword_trigger(text, keywords or DEFAULT_TRIGGER_KEYWORDS)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -382,9 +379,6 @@ async def check_keyword_triggers(
 #  and same return shape, so no caller-side changes needed.
 # ════════════════════════════════════════════════════════════════
 
-import octen_rag as _octen_rag
-
-
 @mcp.tool()
 async def rag_search(search_query: str, top_k: int = 5) -> dict:
     """
@@ -392,10 +386,10 @@ async def rag_search(search_query: str, top_k: int = 5) -> dict:
     cosine similarity (real semantic search, not keyword matching).
 
     First call lazily builds (or loads a cached) FAISS index from
-    skills/rag_corpus.json using the Octen embedding model. Replace
-    that file with your real domain knowledge base (forensic
-    references, manuals, case law, SOPs, etc.) to make this useful
-    in production, then call rebuild_octen_index() once to re-embed.
+    every *.md file in forensic_knowledge/ (gunshot wounds, postmortem
+    changes, thermal injuries, asphyxiation, sharp force injury, etc.)
+    using the Octen embedding model. Call rebuild_octen_index() after
+    editing any file in that folder to re-embed.
 
     Args:
         search_query: Natural-language query (typically the matched
@@ -415,76 +409,13 @@ async def rag_search(search_query: str, top_k: int = 5) -> dict:
 @mcp.tool()
 async def rebuild_octen_index() -> dict:
     """
-    Re-embed and re-index skills/rag_corpus.json from scratch.
+    Re-embed and re-index the forensic_knowledge/*.md corpus from scratch.
 
-    Call this after editing rag_corpus.json — the FAISS index is
-    cached on disk and won't pick up corpus changes automatically.
+    Call this after editing/adding a file in forensic_knowledge/ — the
+    FAISS index is cached on disk and won't pick up corpus changes
+    automatically.
     """
     await asyncio.to_thread(_octen_rag.rebuild_index)
     store = await asyncio.to_thread(_octen_rag.get_vectorstore)
     size = store.index.ntotal if hasattr(store, "index") else 0
     return {"rebuilt": True, "corpus_size": size}
-
-
-# ════════════════════════════════════════════════════════════════
-#  Tool 11 — Any agent → RAG Agent via A2A
-#  (triggered after keyword match, not called unconditionally)
-# ════════════════════════════════════════════════════════════════
-
-RAG_PORT = int(os.getenv("RAG_AGENT_PORT", "8004"))
-
-
-@mcp.tool()
-async def delegate_to_rag_agent(
-    task_id: str,
-    query: str,
-    context_json: str,
-    reason: str,
-) -> dict:
-    """
-    Forward a query + context to the RAG Agent via A2A.
-
-    Call this ONLY after check_keyword_triggers returned triggered=true.
-    Do not call unconditionally — the RAG Agent should only run when
-    the Profiler Agent's own text raised a flagged term.
-
-    Args:
-        task_id:      Correlation ID.
-        query:         The matched sentence(s) or a focused question
-                       derived from them — what to retrieve evidence for.
-        context_json:  Profiler Agent's full result JSON, or "{}".
-        reason:        Which keyword(s) triggered this, e.g.
-                       "Matched keyword: 'cause' in overall_assessment".
-
-    Returns:
-        delegated, rag_result (JSON string), a2a_task_id, or error.
-    """
-    parts = [{
-        "kind": "text",
-        "text": (
-            f"[Triggered by Profiler Agent keyword match — {reason}]\n\n"
-            f"Query: {query}\n\n"
-            f"Profiler context:\n{context_json}"
-        ),
-    }]
-
-    try:
-        body = await _a2a_send_message(
-            url=f"http://localhost:{RAG_PORT}",
-            parts=parts,
-            metadata={"delegated_by": "profiler_agent", "parent_task_id": task_id,
-                      "trigger_reason": reason},
-        )
-    except httpx.HTTPError as exc:
-        return {"delegated": False, "error": str(exc)}
-
-    if "error" in body:
-        return {"delegated": False, "error": str(body["error"])}
-
-    result = body.get("result", {})
-    return {
-        "delegated":   True,
-        "a2a_task_id": result.get("id", ""),
-        "rag_result":  _extract_data_or_text(result),
-        "state":       result.get("status", {}).get("state", "unknown"),
-    }
