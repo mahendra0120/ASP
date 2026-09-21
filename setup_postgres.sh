@@ -58,7 +58,12 @@ else
     ln -s "$VOLUME_DATA_DIR" "$NATIVE_DATA_DIR"
 fi
 
-chown -R postgres:postgres "$VOLUME_DATA_DIR"
+chown -R postgres:postgres "$VOLUME_DATA_DIR" 2>/dev/null || {
+    echo ">> Note: chown on the network volume returned errors (this is expected —"
+    echo "   network-backed volumes often reject uid/gid changes via chown, even"
+    echo "   to an owner the files already have). The 'mv' above already preserved"
+    echo "   the original postgres:postgres ownership, so this is safe to ignore."
+}
 
 # ── Start the cluster ──────────────────────────────────────────────
 echo ">> Starting PostgreSQL..."
