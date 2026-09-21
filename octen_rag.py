@@ -98,9 +98,12 @@ def build_embeddings(
             "device": device,
             "trust_remote_code": True,   # Octen ships custom modeling code
         },
-        encode_kwargs={
-            "normalize_embeddings": True,   # match the model card's usage
-        },
+        # No encode_kwargs — Octen's SentenceTransformer wrapper already
+        # normalizes internally (see docstring above). Passing
+        # normalize_embeddings=True explicitly here breaks on newer
+        # sentence-transformers versions, where the Normalize module's
+        # __init__() no longer accepts that kwarg (normalization is
+        # baked into the model's own pipeline instead).
     )
 
 
