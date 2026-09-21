@@ -48,7 +48,26 @@ fi
 
 PG_VERSION="$(ls /etc/postgresql | sort -V | tail -n1)"
 PG_CLUSTER="main"
+NATIVE_DATA_DIR="/var/lib/postgresql/${PG_VERSION}/${PG_CLUSTER}"
 echo ">> Detected PostgreSQL ${PG_VERSION}, cluster '${PG_CLUSTER}'"
+
+# ── Repair a broken data dir left over from an earlier network-volume
+#    attempt (a symlink pointing at the root-owned volume, or any dir
+#    not owned by postgres) by recreating the cluster from scratch. ──
+NEEDS_REPAIR=false
+if [ -L "$NATIVE_DATA_DIR" ]; then
+    NEEDS_REPAIR=true
+elif [ -d "$NATIVE_DATA_DIR" ] && [ "$(stat -c %U "$NATIVE_DATA_DIR" 2>/dev/null)" != "postgres" ]; then
+    NEEDS_REPAIR=true
+fi
+if [ "$NEEDS_REPAIR" = true ]; then
+    echo ">> Found a broken/root-owned data directory (leftover from an earlier"
+    echo "   attempt) — recreating the local cluster from scratch..."
+    pg_dropcluster --stop "${PG_VERSION}" "${PG_CLUSTER}" 2>/dev/null || true
+    rm -rf "$NATIVE_DATA_DIR"
+    rm -rf "/etc/postgresql/${PG_VERSION}/${PG_CLUSTER}"
+    pg_createcluster "${PG_VERSION}" "${PG_CLUSTER}"
+fi
 
 # ── Start PostgreSQL on its normal LOCAL data directory ───────────
 echo ">> Starting PostgreSQL..."
