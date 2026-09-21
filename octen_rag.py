@@ -70,6 +70,40 @@ OCTEN_MODEL_ID = os.getenv("OCTEN_MODEL_ID", "Octen/Octen-Embedding-0.6B")
 #  Embeddings — Octen via langchain_huggingface
 # ════════════════════════════════════════════════════════════════
 
+def _patch_legacy_normalize_module() -> None:
+    """
+    Work around a checkpoint/library incompatibility, independent of
+    anything in this file's own code.
+
+    Some Hugging Face SentenceTransformer checkpoints (Octen included)
+    still ship a saved config for their Normalize pipeline module using
+    an older sentence-transformers convention that included a
+    'normalize_embeddings' key. Current sentence-transformers versions
+    define Normalize.__init__() with NO parameters (normalization is
+    now unconditional/internal), so loading such a checkpoint raises:
+        TypeError: Normalize.__init__() got an unexpected keyword
+        argument 'normalize_embeddings'
+    This can't be fixed from the caller side (it happens inside
+    SentenceTransformer's own module-loading code, before any of our
+    encode_kwargs/model_kwargs are even consulted), so we patch
+    Normalize.__init__ to accept and discard legacy kwargs instead of
+    pinning to a specific older sentence-transformers version.
+    """
+    try:
+        from sentence_transformers.base.modules.normalize import Normalize
+    except ImportError:
+        return  # older/newer sentence-transformers layout; nothing to patch
+    if getattr(Normalize, "_octen_legacy_patch_applied", False):
+        return
+    _original_init = Normalize.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _original_init(self)  # ignore legacy kwargs like normalize_embeddings
+
+    Normalize.__init__ = _patched_init
+    Normalize._octen_legacy_patch_applied = True
+
+
 def build_embeddings(
     model_id: str = OCTEN_MODEL_ID,
     device: str = "cpu",
@@ -90,6 +124,8 @@ def build_embeddings(
                        "Octen/Octen-Embedding-8B"   (4096-dim, best quality)
         device:   "cpu", "cuda", "cuda:0", etc.
     """
+    _patch_legacy_normalize_module()
+
     from langchain_huggingface import HuggingFaceEmbeddings
 
     return HuggingFaceEmbeddings(
