@@ -22,8 +22,8 @@ Tools:
   delegate_to_profiler_agent   — any agent → Profiler agent via A2A
   delegate_to_forensic_agent   — any agent → Forensic agent via A2A
   fetch_image_base64           — URL → base64 bytes
-  store_result                 — write to shared in-memory store
-  get_result                   — read from shared in-memory store
+  store_result                 — write to the PostgreSQL result store
+  get_result                   — read from the PostgreSQL result store
   compute_image_hash           — SHA-256 fingerprint
   utc_now                      — current UTC ISO timestamp
   log_event                    — structured log line
@@ -36,10 +36,11 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+
+import db
 
 MCP_PORT      = int(os.getenv("MCP_SERVER_PORT",      "9000"))
 PROFILER_PORT = int(os.getenv('PROFILER_AGENT_PORT', '8011'))
@@ -52,8 +53,6 @@ mcp = MCPServer(
         "Use the filesystem MCP server (read_file) for skill files."
     ),
 )
-
-_store: dict[str, Any] = {}   # shared result cache (use Redis in prod)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -265,26 +264,19 @@ async def fetch_image_base64(image_url: str) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════
-#  Tools 4 / 5 — Shared result store
+#  Tools 4 / 5 — Shared result store (PostgreSQL-backed, see db.py)
 # ════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def store_result(task_id: str, agent_id: str, result: str) -> dict:
     """Persist an agent result under task_id:agent_id for later retrieval."""
-    key = f"{task_id}:{agent_id}"
-    _store[key] = {
-        "result":    result,
-        "stored_at": datetime.now(timezone.utc).isoformat(),
-        "agent_id":  agent_id,
-    }
-    return {"stored": True, "key": key}
+    return await db.store_result(task_id, agent_id, result)
 
 
 @mcp.tool()
 async def get_result(task_id: str, agent_id: str) -> dict:
     """Retrieve a stored agent result by task_id + agent_id."""
-    entry = _store.get(f"{task_id}:{agent_id}")
-    return {"found": entry is not None, **(entry or {})}
+    return await db.get_result(task_id, agent_id)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -325,7 +317,10 @@ async def log_event(level: str, source: str, message: str) -> dict:
 
 if __name__ == "__main__":
     print(f"MCP Vision-Tools server  :{MCP_PORT}")
-    mcp.run(transport="sse", port=MCP_PORT)
+    try:
+        mcp.run(transport="sse", port=MCP_PORT)
+    finally:
+        asyncio.run(db.close_pool())
 
 
 # ════════════════════════════════════════════════════════════════
