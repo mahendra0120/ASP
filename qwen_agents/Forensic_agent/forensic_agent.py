@@ -24,8 +24,19 @@ from qwen_agents.model_utils import make_model
 
 load_dotenv()
 
-if os.getenv("HF_TOKEN"):
+if os.getenv("HF_TOKEN") and not os.getenv("HF_HUB_OFFLINE"):
     login(token=os.getenv("HF_TOKEN"))
+elif os.getenv("HF_TOKEN") and os.getenv("HF_HUB_OFFLINE"):
+    # HF_HUB_OFFLINE disables all Hub network calls (including the
+    # whoami check login() makes), so calling login() here would
+    # always raise huggingface_hub.errors.OfflineModeIsEnabled. Skip
+    # it — if the model weights are already cached locally this agent
+    # doesn't need an authenticated session at all; if they're NOT
+    # cached, snapshot_download below will raise its own clear error.
+    print(
+        "HF_HUB_OFFLINE is set — skipping huggingface_hub login() "
+        "(relying on locally cached model weights)."
+    )
 
 # Fine-tuned forensic model. `make_model` pulls this down via
 # huggingface_hub.snapshot_download the first time it's loaded.
