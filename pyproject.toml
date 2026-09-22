@@ -7,7 +7,19 @@ requires-python = ">=3.13"
 dependencies = [
     "asyncpg>=0.30.0",
     "datasets>=4.0,<4.8.6",
-    "fasta2a[pydantic-ai]>=0.6.1",
+    # Pinned (not just floored) on purpose: the client in
+    # A2A_image_delegation_client.py is hand-written against this
+    # exact wire format (fasta2a.schema.Part/Message — verified
+    # directly against 2.0.1's source). This library's A2A message
+    # schema has changed more than once across recent major versions
+    # without warning; an unbounded ">=" constraint here previously
+    # let a newer, incompatible version silently break image/file
+    # delivery to both agents (parts were built in a shape the
+    # installed server no longer recognized). If you deliberately
+    # upgrade this, re-check fasta2a/schema.py's Part/Message
+    # TypedDicts and re-verify A2A_image_delegation_client.py against
+    # them before trusting image delegation again.
+    "fasta2a[pydantic-ai]==2.0.1",
     "fastmcp>=4.0.3",
     "gradio>=6.19.0",
     "httpx>=0.28.1",

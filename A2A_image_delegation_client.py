@@ -3,19 +3,34 @@ A2A_image_delegation_client.py
 ─────────────────────────────────────────────────────────────────
 Minimal JSON-RPC client for talking to fasta2a-served agents.
 
-NOTE: this was originally written against an older draft of the A2A
-spec. The installed fasta2a implements the current spec, where:
-  - the send method is `message/send`, not `tasks/send`
-  - the client sends a `Message` (role/parts/messageId/kind), not a
-    task with a client-chosen id — the server assigns the task id
-  - `Part` is a `kind`-discriminated union: `{"kind": "text", ...}`,
-    `{"kind": "file", "file": {"uri": ..., "mimeType": ...}}`, or
-    `{"kind": "data", "data": ...}` — not a flat `{"url": ...}`
-  - `Message` itself needs `"kind": "message"`
+NOTE: the wire format below was verified directly against the
+installed fasta2a package (pydantic_ai bridge + fasta2a.schema) on
+2026-09-22 — do not trust an older comment here over that. As of
+fasta2a 2.0.1 (the version `fasta2a[pydantic-ai]>=0.6.1` in
+pyproject.toml currently resolves to, since that constraint has no
+upper bound):
+  - the send method is `message/send`, params = {"message": ...}
+  - `Message` = {"role", "parts", "messageId", ...} — camelCase via
+    an alias_generator, and there is NO "kind" field on Message.
+  - `Part` is a FLAT, untagged dict — fields are mutually exclusive
+    by which key is present, there is NO "kind" discriminator and
+    NO nested "file" object:
+        {"text": "..."}                          # text
+        {"url": "...", "mediaType": "image/png"}  # file by URL
+        {"raw": "<base64>", "mediaType": "..."}   # file by bytes
+    `media_type` is aliased to `mediaType` on the wire (same
+    to_camel() aliasing applies to `message_id` -> `messageId`).
   - a completed task's state is `"completed"`, not `"success"`
   - artifacts carry their content in `artifact["parts"]`, each of
     which may have a `text` field — not directly on the artifact
 `tasks/get` and `tasks/cancel` are unchanged from the older draft.
+
+fasta2a has changed this wire format more than once across recent
+releases (see pyproject.toml's fasta2a pin comment) — if agents ever
+start silently not receiving images/files again after a dependency
+update, re-verify this against the actually-installed version's
+`fasta2a/schema.py` (`Part`/`Message` TypedDicts) rather than
+assuming this comment is still accurate.
 """
 
 import os
@@ -33,7 +48,7 @@ class TextPart:
     text: str
 
     def to_dict(self) -> dict:
-        return {"kind": "text", "text": self.text}
+        return {"text": self.text}
 
 
 @dataclass
@@ -42,10 +57,10 @@ class ImagePart:
     media_type: Optional[str] = None
 
     def to_dict(self) -> dict:
-        file_obj = {"uri": self.url}
+        part: dict = {"url": self.url}
         if self.media_type:
-            file_obj["mimeType"] = self.media_type
-        return {"kind": "file", "file": file_obj}
+            part["mediaType"] = self.media_type
+        return part
 
 @dataclass
 class A2AMessage:
@@ -55,7 +70,6 @@ class A2AMessage:
 
     def to_dict(self) -> dict:
         return {
-            "kind": "message",
             "role": self.role,
             "parts": [p.to_dict() for p in self.parts],
             "messageId": self.message_id,
