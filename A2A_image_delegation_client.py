@@ -3,34 +3,52 @@ A2A_image_delegation_client.py
 ─────────────────────────────────────────────────────────────────
 Minimal JSON-RPC client for talking to fasta2a-served agents.
 
-NOTE: the wire format below was verified directly against the
-installed fasta2a package (pydantic_ai bridge + fasta2a.schema) on
-2026-09-22 — do not trust an older comment here over that. As of
-fasta2a 2.0.1 (the version `fasta2a[pydantic-ai]>=0.6.1` in
-pyproject.toml currently resolves to, since that constraint has no
-upper bound):
+WIRE FORMAT — this was a genuinely confusing one across several
+verification passes (see git history / conversation log if this
+needs revisiting), so here is the FULL evidence trail as of
+2026-09-22, all against fasta2a==2.0.1 (pinned in pyproject.toml,
+confirmed to be what's ACTUALLY installed in this repo's .venv via
+`importlib.metadata.version('fasta2a')`, not just what a lockfile
+claims is resolved):
+  1. Direct source inspection of `fasta2a.schema.Message` and `Part`
+     shows both are FLAT TypedDicts with camelCase aliasing — NO
+     "kind" field exists on either one.
+  2. Direct round-trip testing against `fasta2a.schema.a2a_request_ta`
+     — the exact TypeAdapter `applications.py` uses to validate every
+     incoming JSON-RPC request — confirms: a flat, un-tagged part
+     like `{"url": ..., "mediaType": ...}` validates correctly and
+     keeps its data; a "kind"-tagged/nested part like
+     `{"kind": "file", "file": {"uri": ...}}` does NOT raise an
+     error, but silently validates down to an EMPTY `{}` (every field
+     on it is an unrecognized extra key), which then fails later
+     inside the pydantic_ai bridge with "Unsupported part" — this is
+     why sending the kind-tagged format can look like it's "working"
+     (no request-level error) right up until images silently vanish.
+  So: for 2.0.1, the correct, verified wire shape is:
   - the send method is `message/send`, params = {"message": ...}
   - `Message` = {"role", "parts", "messageId", ...} — camelCase via
-    an alias_generator, and there is NO "kind" field on Message.
-  - `Part` is a FLAT, untagged dict — fields are mutually exclusive
-    by which key is present, there is NO "kind" discriminator and
-    NO nested "file" object:
+    an alias_generator (message_id -> messageId), NO "kind" field.
+  - `Part` is FLAT and untagged — fields are mutually exclusive by
+    which key is present, NOT by a "kind" discriminator:
         {"text": "..."}                          # text
         {"url": "...", "mediaType": "image/png"}  # file by URL
         {"raw": "<base64>", "mediaType": "..."}   # file by bytes
-    `media_type` is aliased to `mediaType` on the wire (same
-    to_camel() aliasing applies to `message_id` -> `messageId`).
+    (`media_type` is aliased to `mediaType` on the wire.)
   - a completed task's state is `"completed"`, not `"success"`
   - artifacts carry their content in `artifact["parts"]`, each of
     which may have a `text` field — not directly on the artifact
 `tasks/get` and `tasks/cancel` are unchanged from the older draft.
 
-fasta2a has changed this wire format more than once across recent
-releases (see pyproject.toml's fasta2a pin comment) — if agents ever
-start silently not receiving images/files again after a dependency
-update, re-verify this against the actually-installed version's
-`fasta2a/schema.py` (`Part`/`Message` TypedDicts) rather than
-assuming this comment is still accurate.
+fasta2a's A2A schema has genuinely changed shape more than once
+across its release history (0.6.x used a "kind"-discriminated,
+nested-file shape; 2.0.1 — what's actually pinned and installed
+here — uses this flat shape instead). If this ever needs revisiting
+after a dependency bump, do NOT trust this comment blindly — repeat
+the verification steps above (metadata.version, inspect.getsource on
+Message/Part, and an actual a2a_request_ta.validate_json() round
+trip) against whatever is ACTUALLY importable in the target .venv at
+that time, since a lockfile/pyproject.toml constraint and what's
+truly installed can drift out of sync.
 """
 
 import os

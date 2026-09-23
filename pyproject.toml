@@ -9,16 +9,18 @@ dependencies = [
     "datasets>=4.0,<4.8.6",
     # Pinned (not just floored) on purpose: the client in
     # A2A_image_delegation_client.py is hand-written against this
-    # exact wire format (fasta2a.schema.Part/Message — verified
-    # directly against 2.0.1's source). This library's A2A message
-    # schema has changed more than once across recent major versions
-    # without warning; an unbounded ">=" constraint here previously
-    # let a newer, incompatible version silently break image/file
-    # delivery to both agents (parts were built in a shape the
-    # installed server no longer recognized). If you deliberately
-    # upgrade this, re-check fasta2a/schema.py's Part/Message
-    # TypedDicts and re-verify A2A_image_delegation_client.py against
-    # them before trusting image delegation again.
+    # exact wire format. This went back and forth once already (see
+    # that file's module docstring for the full evidence trail) —
+    # 2.0.1 is now confirmed correct via multiple independent direct
+    # checks against this repo's actual installed .venv, not just
+    # inferred from a lockfile or an isolated test install elsewhere.
+    # If you deliberately upgrade this, you MUST regenerate uv.lock
+    # (`uv lock --upgrade-package fasta2a && uv sync`) AND re-verify
+    # A2A_image_delegation_client.py against the NEW version's actual
+    # installed fasta2a/schema.py + a real a2a_request_ta.validate_json()
+    # round trip — do not trust inference from source reading alone,
+    # and do not trust what a lockfile claims without confirming via
+    # `importlib.metadata.version('fasta2a')` in the real target .venv.
     "fasta2a[pydantic-ai]==2.0.1",
     "fastmcp>=4.0.3",
     "gradio>=6.19.0",
