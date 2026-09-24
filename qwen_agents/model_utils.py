@@ -22,6 +22,7 @@ actually executes the tool and loops generation with the result.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -208,6 +209,110 @@ def _build_tool_instructions(agent_info: AgentInfo) -> Optional[str]:
     )
 
 
+def _build_chat_and_inputs(
+    model,
+    processor,
+    model_id: str,
+    messages: list[ModelMessage],
+    agent_info: AgentInfo,
+    reference_images: Optional[list],
+):
+    """
+    Shared preamble for both the blocking (`_run`) and streaming
+    (`_stream_run`) generation paths: build the Qwen chat-template
+    turns (reference images, tool instructions, output-schema hint)
+    and tokenize them. Returns (inputs, tokenizer).
+    """
+    chat = _extract_chat_messages(messages)
+
+    is_first_turn = not any(isinstance(m, ModelResponse) for m in messages)
+    if reference_images and is_first_turn:
+        ref_content = [
+            {"type": "text", "text": "Reference material (read this before analyzing the case):"}
+        ]
+        for img_path in reference_images:
+            ref_content.append({"type": "image", "image": str(img_path)})
+        chat.insert(0, {"role": "user", "content": ref_content})
+        log.info(f"[{model_id}] Attached {len(reference_images)} reference image(s)")
+
+    has_image = any(
+        isinstance(m.get("content"), list)
+        and any(c.get("type") == "image" for c in m["content"])
+        for m in chat
+        if m["role"] == "user"
+    )
+    log.info(f"[{model_id}] Built chat with {len(chat)} turns (image attached: {has_image})")
+
+    tool_instructions = _build_tool_instructions(agent_info)
+    if tool_instructions:
+        chat.append(
+            {"role": "system", "content": [{"type": "text", "text": tool_instructions}]}
+        )
+        log.info(
+            f"[{model_id}] {len(agent_info.function_tools)} tool(s) available: "
+            f"{[t.name for t in agent_info.function_tools]}"
+        )
+
+    if agent_info.output_tools:
+        schema_hint = json.dumps([t.parameters_json_schema for t in agent_info.output_tools])
+        chat.append(
+            {
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "Respond with ONLY a single JSON object matching this "
+                        f"schema, no prose, no markdown fences: {schema_hint}"
+                    ),
+                }],
+            }
+        )
+
+    inputs = processor.apply_chat_template(
+        chat,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    return inputs, tokenizer
+
+
+def _strip_thinking(raw_text: str) -> str:
+    """
+    Remove a <think>...</think> reasoning block, returning only what
+    comes after it. Falls back to stripping from an unclosed <think>
+    onward (rather than leaking raw chain-of-thought) if the model
+    ran out of budget before emitting the closing tag.
+    """
+    if "</think>" in raw_text:
+        return raw_text.split("</think>", 1)[1]
+    if "<think>" in raw_text:
+        # Unclosed — the model was still "thinking" when generation
+        # stopped. Better to show nothing than leak raw reasoning.
+        return raw_text.split("<think>", 1)[0]
+    return raw_text
+
+
+def _strip_special_tokens(text: str, tokenizer) -> str:
+    """For a COMPLETE final text: remove special tokens and trim whitespace."""
+    return _replace_special_tokens(text, tokenizer).strip()
+
+
+def _replace_special_tokens(text: str, tokenizer) -> str:
+    """
+    For a streaming DELTA: remove special tokens only, WITHOUT
+    trimming whitespace — a delta chunk's leading/trailing space is
+    real inter-word spacing once concatenated with neighboring
+    chunks, not padding to discard (unlike the final-text case).
+    """
+    for special_tok in getattr(tokenizer, "all_special_tokens", []):
+        text = text.replace(special_tok, "")
+    return text
+
+
 def make_model(
     model_id: str,
     *,
@@ -222,9 +327,19 @@ def make_model(
     loaded via unsloth's FastVisionModel (full precision, no 4-bit
     quantization).
 
-    Returns a `FunctionModel` (a model driven by a plain Python callable)
-    so `Agent(model=make_model(...))` works exactly like it would with a
-    hosted-API model, but everything runs on-device with no network call.
+    Returns a `FunctionModel` (a model driven by plain Python
+    callables) so `Agent(model=make_model(...))` works exactly like it
+    would with a hosted-API model, but everything runs on-device with
+    no network call. Both a blocking path (`_run`, used by
+    `agent.run()`) and a streaming path (`_stream_run`, used by
+    `agent.run_stream()`) are provided — see `_stream_run`'s docstring
+    for what "streaming" does and does not cover in this repo's
+    architecture (the model can genuinely stream; the A2A hop between
+    main.py and the agent subprocess currently cannot, since the
+    pinned fasta2a==0.6.1 has no SSE/`message/stream` endpoint).
+
+    Both paths strip a <think>...</think> reasoning block so only the
+    final answer is ever returned to the caller — see `_strip_thinking`.
 
     Supports real MCP/tool execution via a simple text-based tool-call
     protocol (see `_build_tool_instructions`/`_TOOL_CALL_RE`) — if the
@@ -236,72 +351,10 @@ def make_model(
 
     def _run(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
         model, processor = _load(model_id, adapter_path, processor_path)
-        chat = _extract_chat_messages(messages)
-
-        # Attach fixed reference-material images (if configured for this
-        # agent) as their own leading turn — but only on the FIRST
-        # generation for this task, not on follow-up rounds after a tool
-        # call, so we don't re-spend context budget re-attaching them
-        # every round of a multi-step tool-calling loop.
-        is_first_turn = not any(isinstance(m, ModelResponse) for m in messages)
-        if reference_images and is_first_turn:
-            ref_content = [
-                {"type": "text", "text": "Reference material (read this before analyzing the case):"}
-            ]
-            for img_path in reference_images:
-                ref_content.append({"type": "image", "image": str(img_path)})
-            chat.insert(0, {"role": "user", "content": ref_content})
-            log.info(f"[{model_id}] Attached {len(reference_images)} reference image(s)")
-
-        has_image = any(
-            isinstance(m.get("content"), list)
-            and any(c.get("type") == "image" for c in m["content"])
-            for m in chat
-            if m["role"] == "user"
-        )
-        log.info(
-            f"[{model_id}] Built chat with {len(chat)} turns "
-            f"(image attached: {has_image})"
+        inputs, tokenizer = _build_chat_and_inputs(
+            model, processor, model_id, messages, agent_info, reference_images
         )
 
-        tool_instructions = _build_tool_instructions(agent_info)
-        if tool_instructions:
-            chat.append(
-                {"role": "system", "content": [{"type": "text", "text": tool_instructions}]}
-            )
-            log.info(
-                f"[{model_id}] {len(agent_info.function_tools)} tool(s) available: "
-                f"{[t.name for t in agent_info.function_tools]}"
-            )
-
-        # If the agent declared an output schema, ask the model to reply
-        # with JSON matching it.
-        if agent_info.output_tools:
-            schema_hint = json.dumps(
-                [t.parameters_json_schema for t in agent_info.output_tools]
-            )
-            chat.append(
-                {
-                    "role": "system",
-                    "content": [{
-                        "type": "text",
-                        "text": (
-                            "Respond with ONLY a single JSON object matching this "
-                            f"schema, no prose, no markdown fences: {schema_hint}"
-                        ),
-                    }],
-                }
-            )
-
-        inputs = processor.apply_chat_template(
-            chat,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(model.device)
-
-        tokenizer = getattr(processor, "tokenizer", processor)
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -330,14 +383,7 @@ def make_model(
             trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )[0]
 
-        if "</think>" in raw_text:
-            output_text = raw_text.split("</think>", 1)[1]
-        else:
-            output_text = raw_text
-
-        for special_tok in getattr(tokenizer, "all_special_tokens", []):
-            output_text = output_text.replace(special_tok, "")
-        output_text = output_text.strip()
+        output_text = _strip_special_tokens(_strip_thinking(raw_text), tokenizer)
 
         # Detect a tool-call block. If present, return a real ToolCallPart
         # so pydantic-ai actually executes the corresponding tool (e.g. the
@@ -360,4 +406,138 @@ def make_model(
         log.info(f"[{model_id}] Final text answer ({len(output_text)} chars), no tool call")
         return ModelResponse(parts=[TextPart(content=output_text)])
 
-    return FunctionModel(_run, model_name=model_id)
+    async def _stream_run(messages: list[ModelMessage], agent_info: AgentInfo):
+        """
+        Streaming counterpart to `_run`. Yields plain `str` deltas
+        (new text only, not the accumulated total — matching
+        FunctionModel's `handle_text_delta` protocol) representing
+        ONLY the final-answer portion of the generation.
+
+        Thinking-token handling: everything from the start of
+        generation up through the closing `</think>` tag is consumed
+        and DISCARDED here, never yielded — this repo's requirement is
+        "only the final answer in markdown", not a live view into the
+        model's reasoning. We buffer silently until we're past
+        `</think>`, then start yielding real deltas.
+
+        Tool-call handling: pydantic-ai's FunctionModel forbids mixing
+        plain `str` deltas with `DeltaToolCalls` in a single streamed
+        response (see fasta2a's stream_function docstring). Since our
+        tool-call protocol requires the model to emit ONLY a
+        `<tool_call>...</tool_call>` block with no other prose when
+        calling a tool, we can safely decide which "mode" this
+        response is in from its first few post-</think> characters:
+        if they look like the start of a tool call, we suppress all
+        text streaming and, once generation finishes, yield a single
+        complete `DeltaToolCalls` item instead; otherwise we stream
+        real text deltas as they arrive.
+
+        NOTE ON WHAT THIS DOES NOT DO: this streams the *model's*
+        generation, in-process. It is not currently wired across the
+        A2A hop between main.py and this agent's subprocess — the
+        pinned fasta2a==0.6.1 has no SSE/`message/stream` endpoint, so
+        main.py still receives one complete result over plain
+        JSON-RPC. This function is the correct foundation for true
+        end-to-end streaming if that's added later (or for testing
+        agents directly, in-process, without going through A2A).
+        """
+        import threading
+        from transformers import TextIteratorStreamer
+
+        model, processor = _load(model_id, adapter_path, processor_path)
+        inputs, tokenizer = _build_chat_and_inputs(
+            model, processor, model_id, messages, agent_info, reference_images
+        )
+
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=False
+        )
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 1e-5),
+            repetition_penalty=1.15,
+            stop_strings=["</tool_call>"],
+            tokenizer=tokenizer,
+            streamer=streamer,
+        )
+        gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs, daemon=True)
+        gen_thread.start()
+
+        buffer = ""            # raw text so far (special tokens intact)
+        past_think = False     # have we passed the </think> boundary yet?
+        mode: Optional[str] = None   # "text" or "tool_call", decided once, right after </think>
+        already_yielded_len = 0      # how much of the post-</think> text we've already emitted (text mode only)
+        TOOL_CALL_PREFIX = "<tool_call>"
+        sentinel = object()
+
+        while True:
+            chunk = await asyncio.to_thread(next, streamer, sentinel)
+            if chunk is sentinel:
+                break
+            buffer += chunk
+
+            if not past_think:
+                if "</think>" not in buffer:
+                    continue  # still inside <think>...</think> — suppress entirely
+                past_think = True
+
+            after = buffer.split("</think>", 1)[1]
+
+            if mode is None:
+                stripped = after.lstrip()
+                if not stripped:
+                    continue  # nothing meaningful yet, keep waiting
+                if stripped.startswith(TOOL_CALL_PREFIX):
+                    mode = "tool_call"
+                    continue  # suppress; handled once the loop ends, below
+                if TOOL_CALL_PREFIX.startswith(stripped):
+                    continue  # ambiguous prefix (e.g. just "<" or "<tool_c") — keep waiting
+                mode = "text"
+                already_yielded_len = len(after)
+                visible = _replace_special_tokens(after, tokenizer)
+                if visible:
+                    yield visible
+                continue
+
+            if mode == "text":
+                new_part = after[already_yielded_len:]
+                already_yielded_len = len(after)
+                visible = _replace_special_tokens(new_part, tokenizer)
+                if visible:
+                    yield visible
+            # mode == "tool_call": suppress streaming, just keep buffering;
+            # handled once the loop ends, below.
+
+        gen_thread.join()
+
+        if mode == "tool_call" or (mode is None and "<tool_call>" in buffer):
+            final_text = _strip_special_tokens(_strip_thinking(buffer), tokenizer)
+            match = _TOOL_CALL_RE.search(final_text)
+            if match:
+                try:
+                    call_data = json.loads(match.group(1))
+                    tool_call_id = str(uuid.uuid4())
+                    from pydantic_ai.models.function import DeltaToolCall
+                    log.info(f"[{model_id}] (stream) Tool call detected -> {call_data.get('name')}")
+                    yield {
+                        0: DeltaToolCall(
+                            name=call_data["name"],
+                            json_args=json.dumps(call_data.get("arguments", {})),
+                            tool_call_id=tool_call_id,
+                        )
+                    }
+                    return
+                except (json.JSONDecodeError, KeyError) as e:
+                    log.info(f"[{model_id}] (stream) Malformed tool_call block, falling back to text: {e}")
+            # Malformed / didn't actually resolve into a tool call after
+            # all — since we suppressed all along in this branch, we've
+            # yielded nothing yet, so it's still safe to fall back to a
+            # single text item without violating the no-mixing rule.
+            if final_text:
+                yield final_text
+
+        log.info(f"[{model_id}] (stream) Done ({len(buffer)} raw chars)")
+
+    return FunctionModel(_run, stream_function=_stream_run, model_name=model_id)

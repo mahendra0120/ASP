@@ -108,6 +108,11 @@ def save_uploaded_images(images) -> list[str]:
 # =============================================
 
 async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: str):
+    forensic_text = ""
+    profiler_text = ""
+    rag_text = ""
+    final_text = ""
+
     try:
         task_id = str(uuid.uuid4())[:8]
 
@@ -115,23 +120,50 @@ async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: 
         if extra_context and extra_context.strip():
             full_prompt += f"\n\nAdditional Context:\n{extra_context}"
 
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
+
         # 1) The case image(s) (e.g. showing the body) go straight to the
         #    Forensic agent over A2A. It has no MCP/skill access — it just
-        #    analyzes what's in front of it.
-        forensic_data = await step_forensic(image_urls, full_prompt)
+        #    analyzes what's in front of it. This is now GENUINE streaming:
+        #    each `forensic_text` below is the real, growing output of the
+        #    remote model's generation (via fasta2a==2.0.1's `message/stream`
+        #    SSE endpoint), not a replay of an already-finished string.
+        #    Thinking tokens never reach here at all — they're stripped
+        #    before the model layer ever yields a delta (model_utils.py's
+        #    `_stream_run`) and, redundantly, fasta2a's bridge only ever
+        #    forwards TextPart deltas in the first place.
+        async for forensic_text in step_forensic_stream(image_urls, full_prompt):
+            yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
+        forensic_data = forensic_text
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Forensic agent complete — checking RAG grounding..."
 
         # 1.5) The Forensic agent has no tools of its own by design, so the
         #      orchestrator (here) is what watches its report for evidence
         #      of trauma and, if found, fires up the RAG pipeline against
         #      forensic_knowledge/ to ground the finding in reference
         #      material before the Profiler agent ever sees it.
+        # RAG is a FAISS/embedding similarity search over forensic_knowledge/,
+        # not a generative model call — there are no tokens being produced
+        # for it to stream. It returns already-complete passages essentially
+        # atomically, so it is rendered as one block the instant it resolves
+        # rather than faking a progressive reveal of something that was never
+        # incrementally generated in the first place.
         rag_data = await step_forensic_rag(task_id, forensic_data)
+        rag_text = (
+            format_rag_section(rag_data) if rag_data["triggered"]
+            else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
+        )
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Profiler agent..."
 
         # 2) The Forensic agent's result (plus any RAG grounding) is then
         #    forwarded over A2A to the Profiler agent, which is the only
         #    agent with MCP access (to its own criminal-behavioral-analysis
-        #    skill markdown).
-        profiler_data = await step_profiler(image_urls, full_prompt, forensic_data, rag_data)
+        #    skill markdown). Streamed the same genuine way as the Forensic
+        #    step above.
+        async for profiler_text in step_profiler_stream(image_urls, full_prompt, forensic_data, rag_data):
+            yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Profiler agent..."
+        profiler_data = profiler_text
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Finalizing report..."
 
         log.info(f"Combining Forensic + RAG + Profiler results into final profiling report (task_id={task_id})")
         sections = [
@@ -139,73 +171,79 @@ async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: 
             f"## Forensic Analysis\n\n{forensic_data}",
         ]
         if rag_data["triggered"]:
-            sections.append(f"## Forensic Knowledge Base Grounding (RAG)\n\n{format_rag_section(rag_data)}")
+            sections.append(f"## Forensic Knowledge Base Grounding (RAG)\n\n{rag_text}")
         sections.append(f"## Profiler Analysis\n\n{profiler_data}")
         final_markdown = "\n\n".join(sections) + "\n"
 
         Path("pipeline_result.md").write_text(final_markdown)
 
-        rag_out_text = (
-            format_rag_section(rag_data) if rag_data["triggered"]
-            else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
-        )
-
-        return (
-            forensic_data,
-            profiler_data,
-            rag_out_text,
-            final_markdown,
-            "✅ Pipeline completed successfully!",
-        )
+        yield forensic_text, profiler_text, rag_text, final_markdown, "✅ Pipeline completed successfully!"
     except Exception as e:
         error = f"❌ {str(e)}"
-        return error, error, error, error, error
+        yield error, error, error, error, error
 
 
-def run_pipeline(images, image_url, prompt, extra_context):
+async def run_pipeline(images, image_url, prompt, extra_context):
     # Prioritize uploaded images over URL; combine if both given.
     image_urls: list[str] = []
 
     if images:
         if len(images) > MAX_IMAGES:
-            return [f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5
+            yield tuple([f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5)
+            return
         image_urls.extend(save_uploaded_images(images))
 
     if image_url and image_url.strip():
         image_urls.append(image_url.strip())
 
     if not image_urls:
-        return ["❌ Please provide at least one image upload or image URL"] * 5
+        yield tuple(["❌ Please provide at least one image upload or image URL"] * 5)
+        return
 
     if len(image_urls) > MAX_IMAGES:
-        return [f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 5
+        yield tuple([f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 5)
+        return
 
     log.info(f"Pipeline starting with {len(image_urls)} image(s)")
 
     try:
-        return asyncio.run(run_pipeline_async(image_urls, prompt, extra_context))
+        async for update in run_pipeline_async(image_urls, prompt, extra_context):
+            yield update
     except Exception as e:
         error = f"❌ Critical error: {e}"
-        return [error] * 5
+        yield tuple([error] * 5)
 
 
-async def step_forensic(image_urls: list[str], prompt: str):
-    """Send the relevant case image(s) straight to the Forensic agent via A2A."""
-    log.info(f"[1/4] Sending {len(image_urls)} image(s) to Forensic agent")
+async def step_forensic_stream(image_urls: list[str], prompt: str):
+    """
+    Stream the Forensic agent's markdown report as it's generated, via
+    fasta2a==2.0.1's `message/stream` SSE endpoint (A2AClient.stream_task).
+
+    Yields the ACCUMULATED text so far on every delta (not just the new
+    piece), since that's what the Gradio Markdown box needs to redraw
+    each update — callers that want just the tail should diff against
+    the previous yield themselves.
+    """
+    log.info(f"[1/4] Streaming {len(image_urls)} image(s) to Forensic agent")
     image_parts = [
         ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
     ]
     start = time.monotonic()
-    task = await FORENSIC_AGENT.send_task(
-        A2AMessage(parts=[TextPart(prompt), *image_parts])
-    )
+    text = ""
+    try:
+        async for delta in FORENSIC_AGENT.stream_task(
+            A2AMessage(parts=[TextPart(prompt), *image_parts])
+        ):
+            text += delta
+            yield text
+    except RuntimeError as e:
+        elapsed = time.monotonic() - start
+        log.info(f"[1/4] Forensic agent stream FAILED after {elapsed:.1f}s: {e}")
+        raise RuntimeError(f"Forensic agent failed: {e}") from e
     elapsed = time.monotonic() - start
-    if task.failed:
-        log.info(f"[1/4] Forensic agent FAILED after {elapsed:.1f}s: {task.error}")
-        raise RuntimeError(f"Forensic agent failed: {task.error}")
-    result = task.output()
-    log.info(f"[2/4] Forensic agent completed in {elapsed:.1f}s ({len(result)} chars) -- forwarding to Profiler via A2A")
-    return result
+    log.info(f"[2/4] Forensic agent stream finished in {elapsed:.1f}s ({len(text)} chars) -- forwarding to Profiler via A2A")
+    if not text:
+        raise RuntimeError("Forensic agent returned an empty result")
 
 
 async def step_forensic_rag(task_id: str, forensic_report: str) -> dict:
@@ -245,25 +283,41 @@ async def step_forensic_rag(task_id: str, forensic_report: str) -> dict:
 
 
 def format_rag_section(rag_data: dict) -> str:
-    """Render RAG grounding results as a Markdown section."""
+    """
+    Render RAG grounding results as clean Markdown — just the
+    retrieved reference text itself, no retrieval-QA mechanics
+    (query string, per-chunk similarity scores, trigger source) since
+    those are retrieval-internal detail, not part of the answer a
+    reader actually wants to see.
+    """
     if not rag_data["triggered"]:
         return "_Not triggered — Forensic report's 'Evidence of Trauma' section said No._"
 
-    lines = []
-    if rag_data.get("source") == "evidence_of_trauma_section":
-        lines.append("**Triggered by:** Forensic report's 'Evidence of Trauma' section (Yes)")
-    else:
-        lines.append(f"**Triggered by (fallback keyword scan):** {', '.join(rag_data['matched_keywords'])}")
-    lines.append(f"**Retrieval query:** {rag_data['query']}")
-    lines.append("")
-    for i, r in enumerate(rag_data["results"], start=1):
-        lines.append(f"**{i}. {r['source']}** (score: {r['score']})\n\n> {r['text']}\n")
-    return "\n".join(lines)
+    seen_sources: list[str] = []
+    passages: list[str] = []
+    for r in rag_data["results"]:
+        source = r.get("source")
+        if source and source not in seen_sources:
+            seen_sources.append(source)
+        text = r.get("text", "").strip()
+        if text:
+            passages.append(text)
+
+    body = "\n\n".join(passages) if passages else "_No matching reference material found._"
+    if seen_sources:
+        body += f"\n\n*Reference: {', '.join(seen_sources)}*"
+    return body
 
 
-async def step_profiler(image_urls: list[str], prompt: str, forensic_report: str, rag_data: dict | None = None):
-    """Forward the Forensic agent's result (+ original image/notes, + any RAG grounding) to the Profiler agent."""
-    log.info(f"[3/4] Sending {len(image_urls)} image(s) + Forensic result to Profiler agent")
+async def step_profiler_stream(image_urls: list[str], prompt: str, forensic_report: str, rag_data: dict | None = None):
+    """
+    Forward the Forensic agent's result (+ original image/notes, + any
+    RAG grounding) to the Profiler agent, streaming its markdown report
+    as it's generated (same genuine SSE mechanism as
+    `step_forensic_stream` — see that docstring for how thinking tokens
+    and tool-call protocol text are kept out of what's yielded here).
+    """
+    log.info(f"[3/4] Streaming {len(image_urls)} image(s) + Forensic result to Profiler agent")
     # NOTE: `prompt` here is the Gradio "Main Prompt" the user wrote for the
     # FORENSIC agent (see step_forensic) — it is NOT an instruction for the
     # Profiler agent. It's labeled explicitly as background-only below so
@@ -295,16 +349,21 @@ async def step_profiler(image_urls: list[str], prompt: str, forensic_report: str
         ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
     ]
     start = time.monotonic()
-    task = await PROFILER_AGENT.send_task(
-        A2AMessage(parts=[TextPart(combined_prompt), *image_parts])
-    )
+    text = ""
+    try:
+        async for delta in PROFILER_AGENT.stream_task(
+            A2AMessage(parts=[TextPart(combined_prompt), *image_parts])
+        ):
+            text += delta
+            yield text
+    except RuntimeError as e:
+        elapsed = time.monotonic() - start
+        log.info(f"[3/4] Profiler agent stream FAILED after {elapsed:.1f}s: {e}")
+        raise RuntimeError(f"Profiler agent failed: {e}") from e
     elapsed = time.monotonic() - start
-    if task.failed:
-        log.info(f"[3/4] Profiler agent FAILED after {elapsed:.1f}s: {task.error}")
-        raise RuntimeError(f"Profiler agent failed: {task.error}")
-    result = task.output()
-    log.info(f"[4/4] Profiler agent completed in {elapsed:.1f}s ({len(result)} chars) -- combining into final profile")
-    return result
+    log.info(f"[4/4] Profiler agent stream finished in {elapsed:.1f}s ({len(text)} chars) -- combining into final profile")
+    if not text:
+        raise RuntimeError("Profiler agent returned an empty result")
 
 # =============================================
 # Gradio UI

@@ -49,6 +49,20 @@ Message/Part, and an actual a2a_request_ta.validate_json() round
 trip) against whatever is ACTUALLY importable in the target .venv at
 that time, since a lockfile/pyproject.toml constraint and what's
 truly installed can drift out of sync.
+
+STREAMING — `stream_task()` below uses `message/stream`, which is a
+real SSE endpoint in fasta2a==2.0.1 (`applications.py` routes it to
+`TaskManager.stream_message`; confirmed by direct source read of the
+installed package, not assumed from changelog text). This did NOT
+exist in the 0.6.x line this repo's docstrings elsewhere used to
+reference — that comment was accurate for 0.6.x but is now stale for
+what's actually pinned. `agent_to_a2a()` in
+A2A_image_delegation_server.py needs no changes to support it: FastA2A
+handles `message/stream` generically for any agent, and fasta2a's
+`AgentWorker` (fasta2a.pydantic_ai._bridge) automatically streams real
+per-token text deltas whenever the underlying pydantic-ai model
+supports `stream_function` — which qwen_agents/model_utils.py's
+`make_model` already provides via `_stream_run`.
 """
 
 import os
@@ -56,6 +70,7 @@ import json
 import httpx
 import uuid
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -177,7 +192,115 @@ class A2AClient:
 
         print(f"[A2A:{self.base_url}] task {task_id} finished: state={state}, artifacts={len(artifacts)}")
         return A2ATask(id=task_id, state=state, artifacts=artifacts)
-    
+
+    async def stream_task(
+        self,
+        message: A2AMessage,
+        metadata: Optional[dict] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Open a `message/stream` SSE connection (fasta2a>=2.0's
+        `message/stream` JSON-RPC method — confirmed present and
+        working against fasta2a==2.0.1, unlike the older 0.6.x line
+        this repo was originally built against) and yield the answer's
+        text AS IT IS GENERATED: genuine incremental deltas from the
+        remote agent's model, not a post-hoc reveal of an
+        already-finished string.
+
+        How this stays "final answer only": fasta2a's AgentWorker
+        streams TEXT PART deltas only (see `fasta2a.pydantic_ai._bridge
+        ._text_delta`, which only recognizes `TextPart`/`TextPartDelta`
+        events — a `ToolCallPart` is not a text delta and is silently
+        skipped). qwen_agents/model_utils.py's `_stream_run` goes
+        further and never even turns the model's `<think>...</think>`
+        span into a delta in the first place — it buffers and discards
+        everything up through `</think>` before yielding its first
+        chunk. So by the time a chunk reaches this method, it has
+        already had any reasoning tokens and any raw tool-call
+        protocol text removed twice over: once by the model layer,
+        once by the fasta2a bridge layer.
+
+        Graceful non-streaming fallback: if the agent's model does NOT
+        implement `stream_function` (or streaming otherwise fails
+        before any progress), fasta2a's AgentWorker transparently reruns
+        the task without streaming and still delivers the whole answer
+        as a single SSE artifact event once the task completes. This
+        method doesn't need to know which path happened — it just
+        yields whatever chunks arrive, so callers never special-case
+        either one; in the fallback case, the caller simply receives
+        one chunk containing the entire answer instead of many small
+        ones.
+
+        Raises RuntimeError if the task ends in a failed/rejected
+        state, or if the server returns a JSON-RPC error before a task
+        is even created.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "message/stream",
+            "params": {
+                "message": message.to_dict(),
+                **({"metadata": metadata} if metadata else {}),
+            },
+        }
+
+        # Per artifact_id: the text assembled so far, and how much of
+        # it has already been handed to the caller. This lets us
+        # compute a clean delta whether the server sends an
+        # incremental append chunk (append=true, mid-stream) or a
+        # full replacement (append=false — the first chunk of a new
+        # artifact, or the complete final answer sent once more on
+        # completion; see AgentWorker.run_task in fasta2a).
+        assembled: dict[str, str] = {}
+        emitted_len: dict[str, int] = {}
+
+        async with httpx.AsyncClient(timeout=self._timeout) as c:
+            async with c.stream(
+                "POST", self.base_url, json=payload,
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    event = json.loads(line[len("data: "):])
+
+                    if "error" in event:
+                        raise RuntimeError(f"[A2A stream:{self.base_url}] {event['error']}")
+
+                    result = event.get("result") or {}
+
+                    artifact_update = result.get("artifactUpdate")
+                    if artifact_update:
+                        artifact = artifact_update["artifact"]
+                        artifact_id = artifact["artifactId"]
+                        chunk_text = "".join(
+                            part.get("text", "") for part in artifact.get("parts", [])
+                        )
+                        if artifact_update.get("append", False):
+                            assembled[artifact_id] = assembled.get(artifact_id, "") + chunk_text
+                        else:
+                            assembled[artifact_id] = chunk_text
+
+                        already = emitted_len.get(artifact_id, 0)
+                        new_text = assembled[artifact_id][already:]
+                        if new_text:
+                            emitted_len[artifact_id] = len(assembled[artifact_id])
+                            yield new_text
+
+                    status_update = result.get("statusUpdate")
+                    if status_update:
+                        state = status_update["status"]["state"]
+                        if state in ("failed", "rejected"):
+                            err = status_update["status"].get("message")
+                            raise RuntimeError(
+                                f"[A2A stream:{self.base_url}] task {state}: {err}"
+                            )
+                        # "completed" needs no explicit handling: the worker
+                        # closes the event bus right after publishing it,
+                        # which ends aiter_lines() and this generator too.
+
     async def get_task(self, task_id: str) -> A2ATask:
         payload = {
             "jsonrpc": "2.0",
