@@ -319,7 +319,7 @@ def make_model(
     adapter_path: Optional[str] = None,
     processor_path: Optional[str] = None,
     temperature: float = 0.15,
-    max_new_tokens: int = 4096,
+    max_new_tokens: int = 6144,
     reference_images: Optional[list] = None,
 ) -> FunctionModel:
     """
@@ -332,11 +332,20 @@ def make_model(
     would with a hosted-API model, but everything runs on-device with
     no network call. Both a blocking path (`_run`, used by
     `agent.run()`) and a streaming path (`_stream_run`, used by
-    `agent.run_stream()`) are provided — see `_stream_run`'s docstring
-    for what "streaming" does and does not cover in this repo's
-    architecture (the model can genuinely stream; the A2A hop between
-    main.py and the agent subprocess currently cannot, since the
-    pinned fasta2a==0.6.1 has no SSE/`message/stream` endpoint).
+    `agent.run_stream()` and by fasta2a's `message/stream` SSE
+    endpoint) are provided — see `_stream_run`'s docstring for details,
+    including its guarantee to always yield at least one item even on
+    failure (pydantic-ai otherwise raises `ValueError: Stream function
+    must return at least one item`, which used to crash the whole A2A
+    task).
+
+    `max_new_tokens` defaults to 6144 rather than a smaller number
+    specifically because an agent with a large embedded system prompt
+    (e.g. the Profiler's full skill file) doing real step-by-step
+    `<think>` reasoning can otherwise exhaust its budget before ever
+    reaching a final answer — raise it further per-agent (see
+    profiler_agent.py) if that still happens; `_stream_run` logs a
+    clear warning naming this exact cause when it does.
 
     Both paths strip a <think>...</think> reasoning block so only the
     final answer is ever returned to the caller — see `_strip_thinking`.
@@ -432,112 +441,231 @@ def make_model(
         complete `DeltaToolCalls` item instead; otherwise we stream
         real text deltas as they arrive.
 
-        NOTE ON WHAT THIS DOES NOT DO: this streams the *model's*
-        generation, in-process. It is not currently wired across the
-        A2A hop between main.py and this agent's subprocess — the
-        pinned fasta2a==0.6.1 has no SSE/`message/stream` endpoint, so
-        main.py still receives one complete result over plain
-        JSON-RPC. This function is the correct foundation for true
-        end-to-end streaming if that's added later (or for testing
-        agents directly, in-process, without going through A2A).
+        This streams the model's generation in-process AND across the
+        A2A hop: fasta2a==2.0.1's `message/stream` SSE endpoint relays
+        exactly what this generator yields to a remote caller in real
+        time (see A2A_image_delegation_client.py's `stream_task`).
+
+        RELIABILITY GUARANTEE — pydantic-ai's FunctionModel raises
+        `ValueError: Stream function must return at least one item`
+        if this generator ever completes without yielding anything at
+        all, which used to crash the whole A2A task instead of failing
+        gracefully. The entire body below is wrapped in a `try/except`
+        specifically so that ANY failure — model loading, chat
+        template construction, the generation thread crashing or
+        stalling, or generation legitimately ending before any
+        final-answer text was produced (e.g. `max_new_tokens` used up
+        entirely on `<think>` reasoning) — always degrades to exactly
+        one honest, clearly-labeled fallback message instead of
+        propagating and taking the task down.
         """
         import threading
         from transformers import TextIteratorStreamer
 
-        model, processor = _load(model_id, adapter_path, processor_path)
-        inputs, tokenizer = _build_chat_and_inputs(
-            model, processor, model_id, messages, agent_info, reference_images
-        )
+        buffer = ""  # raw text so far (special tokens intact) — used by the fallback below too
+        past_think = False
 
-        streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=False
-        )
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-            temperature=max(temperature, 1e-5),
-            repetition_penalty=1.15,
-            stop_strings=["</tool_call>"],
-            tokenizer=tokenizer,
-            streamer=streamer,
-        )
-        gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs, daemon=True)
-        gen_thread.start()
+        try:
+            model, processor = _load(model_id, adapter_path, processor_path)
+            inputs, tokenizer = _build_chat_and_inputs(
+                model, processor, model_id, messages, agent_info, reference_images
+            )
 
-        buffer = ""            # raw text so far (special tokens intact)
-        past_think = False     # have we passed the </think> boundary yet?
-        mode: Optional[str] = None   # "text" or "tool_call", decided once, right after </think>
-        already_yielded_len = 0      # how much of the post-</think> text we've already emitted (text mode only)
-        TOOL_CALL_PREFIX = "<tool_call>"
-        sentinel = object()
+            streamer = TextIteratorStreamer(
+                tokenizer, skip_prompt=True, skip_special_tokens=False
+            )
+            gen_kwargs = dict(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=max(temperature, 1e-5),
+                repetition_penalty=1.15,
+                stop_strings=["</tool_call>"],
+                tokenizer=tokenizer,
+                streamer=streamer,
+            )
 
-        while True:
-            chunk = await asyncio.to_thread(next, streamer, sentinel)
-            if chunk is sentinel:
-                break
-            buffer += chunk
+            # If model.generate() raises partway through (OOM, a bad
+            # shape, etc.), it can die without ever calling streamer.end()
+            # — which would otherwise leave the consumer loop below
+            # blocked forever on the streamer's queue. Capturing the
+            # exception here and guaranteeing `.end()` either way turns
+            # that failure mode from "hangs the whole pipeline" into
+            # "reported and handled like any other generation failure."
+            gen_error: list[BaseException] = []
 
-            if not past_think:
-                if "</think>" not in buffer:
-                    continue  # still inside <think>...</think> — suppress entirely
-                past_think = True
-
-            after = buffer.split("</think>", 1)[1]
-
-            if mode is None:
-                stripped = after.lstrip()
-                if not stripped:
-                    continue  # nothing meaningful yet, keep waiting
-                if stripped.startswith(TOOL_CALL_PREFIX):
-                    mode = "tool_call"
-                    continue  # suppress; handled once the loop ends, below
-                if TOOL_CALL_PREFIX.startswith(stripped):
-                    continue  # ambiguous prefix (e.g. just "<" or "<tool_c") — keep waiting
-                mode = "text"
-                already_yielded_len = len(after)
-                visible = _replace_special_tokens(after, tokenizer)
-                if visible:
-                    yield visible
-                continue
-
-            if mode == "text":
-                new_part = after[already_yielded_len:]
-                already_yielded_len = len(after)
-                visible = _replace_special_tokens(new_part, tokenizer)
-                if visible:
-                    yield visible
-            # mode == "tool_call": suppress streaming, just keep buffering;
-            # handled once the loop ends, below.
-
-        gen_thread.join()
-
-        if mode == "tool_call" or (mode is None and "<tool_call>" in buffer):
-            final_text = _strip_special_tokens(_strip_thinking(buffer), tokenizer)
-            match = _TOOL_CALL_RE.search(final_text)
-            if match:
+            def _generate():
                 try:
-                    call_data = json.loads(match.group(1))
-                    tool_call_id = str(uuid.uuid4())
-                    from pydantic_ai.models.function import DeltaToolCall
-                    log.info(f"[{model_id}] (stream) Tool call detected -> {call_data.get('name')}")
-                    yield {
-                        0: DeltaToolCall(
-                            name=call_data["name"],
-                            json_args=json.dumps(call_data.get("arguments", {})),
-                            tool_call_id=tool_call_id,
-                        )
-                    }
-                    return
-                except (json.JSONDecodeError, KeyError) as e:
-                    log.info(f"[{model_id}] (stream) Malformed tool_call block, falling back to text: {e}")
-            # Malformed / didn't actually resolve into a tool call after
-            # all — since we suppressed all along in this branch, we've
-            # yielded nothing yet, so it's still safe to fall back to a
-            # single text item without violating the no-mixing rule.
-            if final_text:
-                yield final_text
+                    model.generate(**gen_kwargs)
+                except BaseException as e:  # noqa: BLE001 - deliberately broad; see above
+                    gen_error.append(e)
+                finally:
+                    streamer.end()
 
-        log.info(f"[{model_id}] (stream) Done ({len(buffer)} raw chars)")
+            gen_thread = threading.Thread(target=_generate, daemon=True)
+            gen_thread.start()
+
+            mode: Optional[str] = None   # "text" or "tool_call", decided once, right after </think>
+            already_yielded_len = 0      # how much of the post-</think> text we've already emitted (text mode only)
+            yielded_anything = False     # pydantic-ai's FunctionModel requires >= 1 yield — see fallback below
+            TOOL_CALL_PREFIX = "<tool_call>"
+            sentinel = object()
+            # A safety net on top of the streamer.end()-in-finally
+            # guarantee above (not the primary defense): bounds how long
+            # we'll wait for a single next token before concluding the
+            # generation thread has gotten stuck some other way.
+            CHUNK_TIMEOUT_S = 300.0
+
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        asyncio.to_thread(next, streamer, sentinel), timeout=CHUNK_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        f"[{model_id}] (stream) No token received for {CHUNK_TIMEOUT_S:.0f}s — "
+                        "treating generation as stalled."
+                    )
+                    gen_error.append(TimeoutError(f"Generation stalled for over {CHUNK_TIMEOUT_S:.0f}s"))
+                    break
+                if chunk is sentinel:
+                    break
+                buffer += chunk
+
+                if not past_think:
+                    if "</think>" not in buffer:
+                        continue  # still inside <think>...</think> — suppress entirely
+                    past_think = True
+
+                after = buffer.split("</think>", 1)[1]
+
+                if mode is None:
+                    stripped = after.lstrip()
+                    if not stripped:
+                        continue  # nothing meaningful yet, keep waiting
+                    if stripped.startswith(TOOL_CALL_PREFIX):
+                        mode = "tool_call"
+                        continue  # suppress; handled once the loop ends, below
+                    if TOOL_CALL_PREFIX.startswith(stripped):
+                        continue  # ambiguous prefix (e.g. just "<" or "<tool_c") — keep waiting
+                    mode = "text"
+                    already_yielded_len = len(after)
+                    visible = _replace_special_tokens(after, tokenizer)
+                    if visible:
+                        yielded_anything = True
+                        yield visible
+                    continue
+
+                if mode == "text":
+                    new_part = after[already_yielded_len:]
+                    already_yielded_len = len(after)
+                    visible = _replace_special_tokens(new_part, tokenizer)
+                    if visible:
+                        yielded_anything = True
+                        yield visible
+                # mode == "tool_call": suppress streaming, just keep buffering;
+                # handled once the loop ends, below.
+
+            gen_thread.join(timeout=10.0)
+            if gen_thread.is_alive():
+                # The CHUNK_TIMEOUT_S stall-detection above already gave up
+                # waiting on this thread's output; don't also block here
+                # indefinitely if it still hasn't wound down shortly after.
+                # It's a daemon thread, so leaving it running in the
+                # background doesn't prevent process shutdown — this just
+                # avoids turning one stuck generation into a stuck request.
+                log.warning(
+                    f"[{model_id}] (stream) Generation thread still alive "
+                    "10s after stall/completion was detected — abandoning "
+                    "it and returning the fallback response."
+                )
+
+            if mode == "tool_call" or (mode is None and "<tool_call>" in buffer):
+                final_text = _strip_special_tokens(_strip_thinking(buffer), tokenizer)
+                match = _TOOL_CALL_RE.search(final_text)
+                if match:
+                    try:
+                        call_data = json.loads(match.group(1))
+                        tool_call_id = str(uuid.uuid4())
+                        from pydantic_ai.models.function import DeltaToolCall
+                        log.info(f"[{model_id}] (stream) Tool call detected -> {call_data.get('name')}")
+                        yield {
+                            0: DeltaToolCall(
+                                name=call_data["name"],
+                                json_args=json.dumps(call_data.get("arguments", {})),
+                                tool_call_id=tool_call_id,
+                            )
+                        }
+                        return
+                    except (json.JSONDecodeError, KeyError) as e:
+                        log.info(f"[{model_id}] (stream) Malformed tool_call block, falling back to text: {e}")
+                # Malformed / didn't actually resolve into a tool call after
+                # all — since we suppressed all along in this branch, we've
+                # yielded nothing yet, so it's still safe to fall back to a
+                # single text item without violating the no-mixing rule.
+                if final_text:
+                    yielded_anything = True
+                    yield final_text
+
+            if not yielded_anything:
+                # This happens whenever generation ends before any
+                # post-</think> text was ever yielded, chiefly:
+                #   - max_new_tokens was exhausted while still inside
+                #     <think> (past_think never became True at all) — the
+                #     more elaborate/heavily-prompted an agent's reasoning
+                #     is relative to its token budget, the likelier this
+                #     is (this is what was happening to the Profiler
+                #     agent with its large embedded skill file pushing it
+                #     into long reasoning traces — see PROFILER_MODEL_ID's
+                #     larger `max_new_tokens` in profiler_agent.py).
+                #   - </think> was reached but generation ended before any
+                #     non-whitespace, non-tool-call text followed it.
+                #   - a tool-call block was detected but turned out
+                #     malformed AND stripped down to nothing.
+                #   - the generation thread crashed or stalled (gen_error
+                #     non-empty) before producing anything usable.
+                # In every case we must still yield exactly one item — but
+                # NEVER the raw, un-stripped chain-of-thought (that would
+                # violate the "only the final answer" requirement) — so we
+                # yield a clear, honest placeholder instead, and log
+                # loudly so this is easy to diagnose.
+                if gen_error:
+                    log.warning(f"[{model_id}] (stream) Generation failed: {gen_error[0]!r}")
+                    yield (
+                        "_⚠️ Generation failed before producing an answer "
+                        f"({type(gen_error[0]).__name__}: {gen_error[0]}). Try again._"
+                    )
+                elif not past_think:
+                    log.warning(
+                        f"[{model_id}] (stream) Hit max_new_tokens ({max_new_tokens}) "
+                        "while still inside <think> — no final answer was produced."
+                    )
+                    yield (
+                        "_⚠️ The model ran out of its generation budget while still "
+                        "reasoning and never produced a final answer. Try again, or "
+                        "increase `max_new_tokens` for this agent._"
+                    )
+                else:
+                    log.warning(
+                        f"[{model_id}] (stream) Reached </think> but produced no "
+                        "usable final-answer text before generation ended."
+                    )
+                    yield (
+                        "_⚠️ The model finished reasoning but generation ended "
+                        "before it wrote a final answer. Try again, or increase "
+                        "`max_new_tokens` for this agent._"
+                    )
+
+            log.info(f"[{model_id}] (stream) Done ({len(buffer)} raw chars)")
+
+        except Exception as e:
+            # Catches everything not already handled above: a crash while
+            # loading the model, building the chat template, or any other
+            # unexpected failure before/without a yield. Logged with the
+            # full traceback since this is the case we most want visibility
+            # into, and — critically — still yields exactly one item so
+            # fasta2a's AgentWorker never sees an empty stream.
+            log.exception(f"[{model_id}] (stream) Unhandled error in _stream_run")
+            yield f"_⚠️ Internal error while generating this agent's response: {type(e).__name__}: {e}._"
 
     return FunctionModel(_run, stream_function=_stream_run, model_name=model_id)

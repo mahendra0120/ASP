@@ -6,10 +6,12 @@ import os
 import asyncio
 import logging
 import mimetypes
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import aclosing
 from pathlib import Path
 import shutil
 
@@ -34,8 +36,20 @@ load_dotenv()
 # Global variables
 mcp_proc = None
 a2a_proc = None
+REPO_ROOT = Path(__file__).resolve().parent
 TEMP_IMAGE_DIR = Path("temp_uploads")
 TEMP_IMAGE_DIR.mkdir(exist_ok=True)
+
+MCP_PORT = int(os.getenv("MCP_SERVER_PORT", "9000"))
+PROFILER_PORT = int(os.getenv("PROFILER_AGENT_PORT", "8011"))
+FORENSIC_PORT = int(os.getenv("FORENSIC_AGENT_PORT", "8002"))
+
+# Sent as the per-request user-turn text alongside the case images. The
+# actual task instructions (autopsy-only framing, the <think> block, the
+# required output sections) now live in forensic_agent.py's system_prompt
+# — this is just the minimal turn needed to hand the images over, since
+# the "Main Prompt" textbox has been removed from the UI below.
+FORENSIC_USER_MESSAGE = "Analyze the attached autopsy photograph(s) and produce your forensic report."
 
 
 def guess_image_media_type(url_or_path: str) -> str:
@@ -55,25 +69,130 @@ def guess_image_media_type(url_or_path: str) -> str:
 # Server Management (unchanged)
 # =============================================
 
-def launch_servers():
-    global mcp_proc, a2a_proc
+def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
+    """Quick TCP connect check — used to confirm a subprocess is actually
+    listening rather than trusting that Popen() returning means it's up."""
     try:
-        mcp_proc = subprocess.Popen([sys.executable, "Image_delegation_mcp.py"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        a2a_proc = subprocess.Popen([sys.executable, "A2A_image_delegation_server.py"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return f"✅ Servers started (MCP:9000 | Profiler:{os.getenv('PROFILER_AGENT_PORT', '8011')} | Forensic:{os.getenv('FORENSIC_AGENT_PORT', '8002')})"
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_ports(ports: dict[str, int], timeout: float = 60.0, interval: float = 1.0) -> dict[str, bool]:
+    """Poll a set of {label: port} until each is open or `timeout` elapses.
+    Returns {label: reached_or_not}."""
+    remaining = dict(ports)
+    deadline = time.monotonic() + timeout
+    ready: dict[str, bool] = {}
+    while remaining and time.monotonic() < deadline:
+        for label, port in list(remaining.items()):
+            if _port_open(port):
+                ready[label] = True
+                del remaining[label]
+        if remaining:
+            time.sleep(interval)
+    for label in remaining:
+        ready[label] = False
+    return ready
+
+
+def _process_alive(proc: subprocess.Popen | None) -> bool:
+    return proc is not None and proc.poll() is None
+
+
+def launch_servers():
+    """
+    Start the MCP tools server and the combined Profiler+Forensic A2A
+    server as subprocesses, then actually verify they came up before
+    reporting success.
+
+    Fixes over the previous version, which just called Popen() and
+    immediately reported "started" regardless of what actually
+    happened:
+      - Uses absolute paths (REPO_ROOT / "<file>.py") and sets `cwd`
+        explicitly, so this no longer depends on whatever directory
+        the Gradio app process happens to have been launched from —
+        a relative "Image_delegation_mcp.py" silently fails to be
+        found (and used to just report a generic launch error, or
+        nothing at all) if main.py isn't run with the repo root as
+        the working directory.
+      - Refuses to double-launch if a server from a previous click is
+        still alive.
+      - Captures each subprocess's stdout/stderr to a log file (rather
+        than an unread PIPE, which can eventually deadlock a
+        subprocess once its output buffer fills) and polls the actual
+        ports until they're open (or a fixed timeout elapses),
+        reporting per-service success/failure instead of a blanket
+        "started".
+    """
+    global mcp_proc, a2a_proc
+
+    if _process_alive(mcp_proc) and _process_alive(a2a_proc):
+        return "ℹ️ Servers already running — stop them first if you want to restart."
+
+    mcp_script = REPO_ROOT / "Image_delegation_mcp.py"
+    a2a_script = REPO_ROOT / "A2A_image_delegation_server.py"
+    missing = [p.name for p in (mcp_script, a2a_script) if not p.exists()]
+    if missing:
+        return f"❌ Server launch failed: missing file(s) in {REPO_ROOT}: {', '.join(missing)}"
+
+    log_dir = REPO_ROOT / "server_logs"
+    log_dir.mkdir(exist_ok=True)
+    mcp_log = open(log_dir / "mcp_server.log", "a")
+    a2a_log = open(log_dir / "a2a_server.log", "a")
+
+    try:
+        mcp_proc = subprocess.Popen(
+            [sys.executable, str(mcp_script)],
+            stdout=mcp_log, stderr=subprocess.STDOUT,
+            cwd=str(REPO_ROOT),
+        )
+        a2a_proc = subprocess.Popen(
+            [sys.executable, str(a2a_script)],
+            stdout=a2a_log, stderr=subprocess.STDOUT,
+            cwd=str(REPO_ROOT),
+        )
     except Exception as e:
         return f"❌ Server launch failed: {e}"
 
+    ready = _wait_for_ports(
+        {"MCP": MCP_PORT, "Profiler": PROFILER_PORT, "Forensic": FORENSIC_PORT},
+        timeout=60.0,
+    )
+
+    # A process that already exited tells us more than "port never opened"
+    # — surface that explicitly, and point at the log file to read why.
+    lines = []
+    for label, port, proc, logfile in (
+        ("MCP", MCP_PORT, mcp_proc, log_dir / "mcp_server.log"),
+        ("Profiler", PROFILER_PORT, a2a_proc, log_dir / "a2a_server.log"),
+        ("Forensic", FORENSIC_PORT, a2a_proc, log_dir / "a2a_server.log"),
+    ):
+        if ready.get(label):
+            lines.append(f"✅ {label}:{port}")
+        elif not _process_alive(proc):
+            lines.append(f"❌ {label}:{port} — process exited early (see {logfile})")
+        else:
+            lines.append(f"⚠️ {label}:{port} — not responding after 60s (see {logfile})")
+
+    return "\n".join(lines)
+
 
 def stop_servers():
-    for proc in (mcp_proc, a2a_proc):
+    global mcp_proc, a2a_proc
+    stopped = []
+    for name, proc in (("MCP", mcp_proc), ("A2A (Profiler+Forensic)", a2a_proc)):
         if proc:
             proc.terminate()
-            try: proc.wait(5)
-            except: proc.kill()
-    return "🛑 Servers stopped."
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            stopped.append(name)
+    mcp_proc = None
+    a2a_proc = None
+    return f"🛑 Stopped: {', '.join(stopped)}" if stopped else "ℹ️ No servers were running."
 
 
 # =============================================
@@ -107,7 +226,7 @@ def save_uploaded_images(images) -> list[str]:
 # Pipeline
 # =============================================
 
-async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: str):
+async def run_pipeline_async(image_urls: list[str], extra_context: str):
     forensic_text = ""
     profiler_text = ""
     rag_text = ""
@@ -116,52 +235,74 @@ async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: 
     try:
         task_id = str(uuid.uuid4())[:8]
 
-        full_prompt = prompt
+        forensic_message = FORENSIC_USER_MESSAGE
         if extra_context and extra_context.strip():
-            full_prompt += f"\n\nAdditional Context:\n{extra_context}"
+            forensic_message += f"\n\nAdditional Context:\n{extra_context}"
 
         yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
 
-        # 1) The case image(s) (e.g. showing the body) go straight to the
-        #    Forensic agent over A2A. It has no MCP/skill access — it just
-        #    analyzes what's in front of it. This is now GENUINE streaming:
-        #    each `forensic_text` below is the real, growing output of the
-        #    remote model's generation (via fasta2a==2.0.1's `message/stream`
-        #    SSE endpoint), not a replay of an already-finished string.
-        #    Thinking tokens never reach here at all — they're stripped
-        #    before the model layer ever yields a delta (model_utils.py's
-        #    `_stream_run`) and, redundantly, fasta2a's bridge only ever
-        #    forwards TextPart deltas in the first place.
-        async for forensic_text in step_forensic_stream(image_urls, full_prompt):
+        # 1) The case image(s) go straight to the Forensic agent over A2A.
+        #    It has no MCP/skill access — it just analyzes what's in front
+        #    of it. This is GENUINE streaming: each `forensic_text` below
+        #    is the real, growing output of the remote model's generation
+        #    (via fasta2a==2.0.1's `message/stream` SSE endpoint), not a
+        #    replay of an already-finished string. Thinking tokens never
+        #    reach here at all — stripped before the model layer ever
+        #    yields a delta (model_utils.py's `_stream_run`) and,
+        #    redundantly, fasta2a's bridge only ever forwards TextPart
+        #    deltas in the first place.
+        #
+        #    This step has to happen alone, first: both of the next two
+        #    steps need its finished text as input.
+        async for forensic_text in step_forensic_stream(image_urls, forensic_message):
             yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
         forensic_data = forensic_text
-        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Forensic agent complete — checking RAG grounding..."
-
-        # 1.5) The Forensic agent has no tools of its own by design, so the
-        #      orchestrator (here) is what watches its report for evidence
-        #      of trauma and, if found, fires up the RAG pipeline against
-        #      forensic_knowledge/ to ground the finding in reference
-        #      material before the Profiler agent ever sees it.
-        # RAG is a FAISS/embedding similarity search over forensic_knowledge/,
-        # not a generative model call — there are no tokens being produced
-        # for it to stream. It returns already-complete passages essentially
-        # atomically, so it is rendered as one block the instant it resolves
-        # rather than faking a progressive reveal of something that was never
-        # incrementally generated in the first place.
-        rag_data = await step_forensic_rag(task_id, forensic_data)
-        rag_text = (
-            format_rag_section(rag_data) if rag_data["triggered"]
-            else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
+        yield forensic_text, profiler_text, rag_text, final_text, (
+            "⏳ Forensic agent complete — running Profiler agent and RAG grounding concurrently..."
         )
-        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Profiler agent..."
 
-        # 2) The Forensic agent's result (plus any RAG grounding) is then
-        #    forwarded over A2A to the Profiler agent, which is the only
-        #    agent with MCP access (to its own criminal-behavioral-analysis
-        #    skill markdown). Streamed the same genuine way as the Forensic
-        #    step above.
-        async for profiler_text in step_profiler_stream(image_urls, full_prompt, forensic_data, rag_data):
-            yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Profiler agent..."
+        # 2) RAG and the Profiler agent now run AT THE SAME TIME, both
+        #    driven off the just-finished Forensic report:
+        #      - RAG (a FAISS/embedding similarity search over
+        #        forensic_knowledge/, CPU-bound, no model generation) reads
+        #        the Forensic report's own "## Evidence of Trauma" section
+        #        to decide whether to fire, then fetches grounding passages.
+        #      - The Profiler agent (GPU-bound generation, the slow part)
+        #        receives the Forensic report + case images and starts
+        #        generating immediately — it does NOT wait for RAG this
+        #        time, since RAG is normally so much faster than a full
+        #        model generation that it finishes well before the
+        #        Profiler does anyway. If the Profiler's report happens to
+        #        need the RAG passages verbatim quoted, this is the
+        #        trade-off: it no longer blocks on them first. If you'd
+        #        rather have the Profiler wait and receive RAG grounding
+        #        merged into its own prompt, that's the previous
+        #        strictly-sequential design and is easy to restore — just
+        #        say so.
+        #    RAG is wrapped as a single-item async generator so it can be
+        #    fanned in alongside the Profiler's real multi-chunk stream —
+        #    whichever finishes a step first updates its own panel
+        #    immediately rather than waiting on the other.
+        rag_task_gen = _one_shot_stream(step_forensic_rag(task_id, forensic_data))
+        profiler_gen = step_profiler_stream(image_urls, forensic_data)
+
+        async with aclosing(_run_concurrently({"rag": rag_task_gen, "profiler": profiler_gen})) as stream:
+            async for latest, errors in stream:
+                if errors:
+                    raise RuntimeError(
+                        "; ".join(f"{k} step: {e}" for k, e in errors.items())
+                    )
+                if latest["rag"] != "":
+                    rag_data = latest["rag"]
+                    rag_text = (
+                        format_rag_section(rag_data) if rag_data["triggered"]
+                        else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
+                    )
+                if latest["profiler"] != "":
+                    profiler_text = latest["profiler"]
+                yield forensic_text, profiler_text, rag_text, final_text, (
+                    "⏳ Running Profiler agent and RAG grounding concurrently..."
+                )
         profiler_data = profiler_text
         yield forensic_text, profiler_text, rag_text, final_text, "⏳ Finalizing report..."
 
@@ -183,7 +324,66 @@ async def run_pipeline_async(image_urls: list[str], prompt: str, extra_context: 
         yield error, error, error, error, error
 
 
-async def run_pipeline(images, image_url, prompt, extra_context):
+async def _one_shot_stream(coro):
+    """Wrap a plain coroutine as a single-item async generator, so a
+    one-shot awaitable (like the RAG step) can be fanned in alongside a
+    real multi-chunk stream (like the Profiler agent) via
+    `_run_concurrently`."""
+    yield await coro
+
+
+async def _run_concurrently(gens: dict):
+    """
+    Fan-in helper: runs several async generators at once and yields
+    (latest, errors) as soon as ANY of them produces a new value, so the
+    UI can update whichever panel just changed without waiting on the
+    others.
+
+    `gens` maps a short key (e.g. "profiler") to an async generator.
+    `latest[key]` starts as `""` and is replaced with whatever that
+    generator yields (a growing string for a real stream, or a single
+    dict for a one-shot step wrapped via `_one_shot_stream`) — callers
+    distinguish "not yet available" from "available" by checking for
+    that initial `""` sentinel. Stops once every generator is exhausted;
+    if any raises, its exception is reported via `errors` on the same
+    yield instead of propagating immediately, so the caller can decide
+    whether to keep going or abort.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    latest: dict = {k: "" for k in gens}
+    pending = set(gens)
+
+    async def _pump(key, gen):
+        try:
+            async for chunk in gen:
+                await queue.put((key, "chunk", chunk))
+        except Exception as e:
+            await queue.put((key, "error", e))
+        finally:
+            await queue.put((key, "done", None))
+
+    tasks = [asyncio.create_task(_pump(k, g)) for k, g in gens.items()]
+    errors: dict[str, Exception] = {}
+
+    try:
+        while pending:
+            key, kind, payload = await queue.get()
+            if kind == "chunk":
+                latest[key] = payload
+                yield dict(latest), dict(errors)
+            elif kind == "error":
+                errors[key] = payload
+                pending.discard(key)
+                yield dict(latest), dict(errors)
+            elif kind == "done":
+                pending.discard(key)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+
+async def run_pipeline(images, image_url, extra_context):
     # Prioritize uploaded images over URL; combine if both given.
     image_urls: list[str] = []
 
@@ -207,7 +407,7 @@ async def run_pipeline(images, image_url, prompt, extra_context):
     log.info(f"Pipeline starting with {len(image_urls)} image(s)")
 
     try:
-        async for update in run_pipeline_async(image_urls, prompt, extra_context):
+        async for update in run_pipeline_async(image_urls, extra_context):
             yield update
     except Exception as e:
         error = f"❌ Critical error: {e}"
@@ -309,32 +509,16 @@ def format_rag_section(rag_data: dict) -> str:
     return body
 
 
-async def step_profiler_stream(image_urls: list[str], prompt: str, forensic_report: str, rag_data: dict | None = None):
+async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_data: dict | None = None):
     """
-    Forward the Forensic agent's result (+ original image/notes, + any
-    RAG grounding) to the Profiler agent, streaming its markdown report
-    as it's generated (same genuine SSE mechanism as
-    `step_forensic_stream` — see that docstring for how thinking tokens
-    and tool-call protocol text are kept out of what's yielded here).
+    Forward the Forensic agent's result (+ original images, + any RAG
+    grounding) to the Profiler agent, streaming its markdown report as
+    it's generated (same genuine SSE mechanism as `step_forensic_stream`
+    — see that docstring for how thinking tokens and tool-call protocol
+    text are kept out of what's yielded here).
     """
     log.info(f"[3/4] Streaming {len(image_urls)} image(s) + Forensic result to Profiler agent")
-    # NOTE: `prompt` here is the Gradio "Main Prompt" the user wrote for the
-    # FORENSIC agent (see step_forensic) — it is NOT an instruction for the
-    # Profiler agent. It's labeled explicitly as background-only below so
-    # the Profiler doesn't mistake it for its own directive (its actual
-    # task/format come entirely from its own system prompt / skill file —
-    # see profiler_agent.py). Do not remove this labeling or fold `prompt`
-    # back into the message as if it were addressed to the Profiler.
-    combined_prompt = (
-        "Note: the text below headed 'Original instructions given to the "
-        "Forensic agent' was the Main Prompt provided to the FORENSIC "
-        "agent — it is not an instruction to you. It's included only as "
-        "background on what the Forensic agent was asked to do. Your own "
-        "task and required report format are defined by your own system "
-        "prompt / skill file, not by this text.\n\n"
-        f"Original instructions given to the Forensic agent (context only):\n{prompt}\n\n"
-        f"Forensic agent report (from A2A):\n{forensic_report}"
-    )
+    combined_prompt = f"Forensic agent report (from A2A):\n{forensic_report}"
     if rag_data and rag_data.get("triggered"):
         trigger_desc = (
             "its Evidence of Trauma section" if rag_data.get("source") == "evidence_of_trauma_section"
@@ -375,7 +559,7 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Server Control")
-            server_status = gr.Textbox(label="Status", value="Not started", lines=2, interactive=False)
+            server_status = gr.Textbox(label="Status", value="Not started", lines=4, interactive=False)
             with gr.Row():
                 gr.Button("🚀 Start Servers", variant="primary").click(launch_servers, outputs=server_status)
                 gr.Button("⏹ Stop Servers").click(stop_servers, outputs=server_status)
@@ -392,27 +576,24 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
                 with gr.Tab("🔗 Image URL"):
                     url_input = gr.Textbox(label="Image URL", placeholder="https://...", lines=1)
 
-            prompt = gr.Textbox(
-                label="Main Prompt",
-                lines=3,
-                value="Perform a comprehensive visual analysis..."
-            )
-            
             extra_context = gr.Textbox(
                 label="Additional Context (Optional)",
                 placeholder="This photo was taken in a forest during autumn. The person is a biologist studying mushrooms.",
                 lines=3
             )
-            
+
     run_btn = gr.Button("▶ Run Pipeline", variant="primary", size="large")
 
     with gr.Row():
         with gr.Column():
             forensic_out = gr.Markdown(label="🔬 Forensic Agent (no MCP)")
         with gr.Column():
-            profiler_out = gr.Markdown(label="🔍 Profiler Agent (MCP: skills/ only)")
+            profiler_out = gr.Markdown(label="🔍 Profiler Agent (MCP: skills/ only) — runs concurrently with RAG")
 
-    gr.Markdown("### 📚 RAG Grounding (triggered by evidence-of-trauma language in the Forensic report)")
+    gr.Markdown(
+        "### 📚 RAG Grounding (triggered by the Forensic report's own 'Evidence of "
+        "Trauma' verdict — runs concurrently with the Profiler agent, not before it)"
+    )
     rag_out = gr.Markdown(label="Forensic Knowledge Base Grounding")
 
     with gr.Accordion("📄 Full Result", open=False):
@@ -423,7 +604,7 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
     # Run button
     run_btn.click(
         fn=run_pipeline,
-        inputs=[image_input, url_input, prompt, extra_context],
+        inputs=[image_input, url_input, extra_context],
         outputs=[forensic_out, profiler_out, rag_out, full_out, status_out],
     )
 

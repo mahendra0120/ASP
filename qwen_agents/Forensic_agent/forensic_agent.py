@@ -3,7 +3,21 @@ forensic_agent.py
 ─────────────────────────────────────────────────────────────────
 Agent 2 in the pipeline — receives the image(s) relevant to the case
 (e.g. the shot(s) showing the body) directly over A2A and produces a
-a markdown forensic report.
+markdown forensic report.
+
+The system prompt now explicitly instructs step-by-step reasoning
+inside a <think>...</think> block before the final answer — this
+agent's checkpoint isn't a "-Thinking-"-branded model the way the
+Profiler's is, so without this instruction it wouldn't reliably wrap
+its reasoning in <think> tags at all, and model_utils.py's
+`_strip_thinking`/`_stream_run` would have nothing to strip. With it,
+the same stripping logic applies here too, and only the finished
+report (never the reasoning) reaches the caller. Because this now
+does real reasoning before answering, `max_new_tokens` is raised well
+above the FunctionModel default (see `make_model` call below) so a
+long <think> block doesn't exhaust the budget before any final answer
+is produced — see model_utils.py's `_stream_run` for the graceful
+fallback if it still does.
 
 IMPORTANT — no MCP here on purpose:
 There is no forensic-skill markdown file for this agent to read, so
@@ -48,28 +62,31 @@ FORENSIC_MODEL_ID = os.getenv(
 
 # No toolsets — no MCP servers of any kind are attached to this agent.
 forensic_agent: Agent[None, str] = Agent(
-    model=make_model(FORENSIC_MODEL_ID),
+    model=make_model(FORENSIC_MODEL_ID, max_new_tokens=6144),
     system_prompt=(
-        "You are a forensic image-analysis agent. You are given one or more "
-        "images relevant to a case (for example, images showing a body) and "
-        "any accompanying notes.\n\n"
-        "You have no tools and no external skill file — analyze only what is "
-        "visible in the image(s) you were given and write your findings as "
-        "a clear Markdown report. Be precise and factual.\n\n"
-        "CRITICAL — avoid template padding: describe ONLY injuries/findings "
-        "you can actually see. Do NOT assume a symmetric or repeated "
-        "pattern across body regions (e.g. do not report an injury on "
-        "every region just because you found one on some regions). "
-        "Examine each area independently: if a region shows no visible "
-        "injury or finding, either omit it or explicitly say 'no visible "
-        "injury' — never invent one to match a pattern from other "
-        "regions. If a detail isn't clearly visible (exact measurements, "
-        "wound depth, weapon type, etc.), say so explicitly rather than "
-        "guessing a specific-sounding number or detail.\n\n"
-        "MANDATORY FINAL SECTION — end every report with exactly this "
-        "heading, verbatim:\n"
+        "You are a forensic pathology assistant. You are given only "
+        "autopsy photographs — no written report, case file, or "
+        "examiner's notes accompany them. Base every finding strictly "
+        "on what is visible in the images; never assume or invent "
+        "detail that is not directly observable.\n\n"
+        "Respond in two parts:\n"
+        "1. Inside a single <think>...</think> block, reason step by "
+        "step: scan the photographs for wounds, marks, or "
+        "discoloration; note their location, size, shape, and edge "
+        "character; group them into injury categories; and weigh them "
+        "together toward a cause of death, manner of death, and "
+        "weapon. Do not state the final determinations inside the "
+        "think block — work toward them, don't reveal them yet.\n"
+        "2. Outside the think block, write the Brief Summary and "
+        "Examination sections in standard forensic documentation "
+        "style, followed by the cause of death, manner of death, "
+        "murder weapon, reported circumstances of death, general "
+        "external examination, and evidence of trauma.\n\n"
+        "MANDATORY FINAL SECTION — the very last thing in part 2 above "
+        "must be exactly this heading, verbatim, on its own line:\n"
         "## Evidence of Trauma\n"
-        "The first word of this section MUST be either 'Yes' or 'No'.\n"
+        "The first word immediately following this heading MUST be "
+        "either 'Yes' or 'No'.\n"
         "  - If No: write 'No.' followed by one sentence confirming no "
         "traumatic findings were observed.\n"
         "  - If Yes: write 'Yes.' followed by a plain-language list of "
@@ -77,7 +94,9 @@ forensic_agent: Agent[None, str] = Agent(
         "wound, ligature mark, stab wound, contusion, burn) so it can "
         "be used as a search query against a forensic reference "
         "knowledge base — do not just say 'see above', restate the "
-        "findings here in your own words."
+        "findings here in your own words. This exact heading and "
+        "Yes/No convention is required by the pipeline's downstream "
+        "RAG grounding step — do not paraphrase or omit it."
     ),
     toolsets=[],
     retries=2,
