@@ -78,15 +78,25 @@ def _download(repo_id: str) -> str:
 
 def _load_with_unsloth(local_path: str, processor_path: Optional[str], load_in_4bit: bool):
     """
-    Load via unsloth's FastVisionModel. Full precision is faster/lighter
-    to run inference through than plain transformers thanks to unsloth's
-    fused kernels, but two ~8B-parameter VL checkpoints at full precision
-    sharing one GPU (Profiler + Forensic both run in this process) can
-    easily exceed available VRAM — that shows up as a CUDA OOM crash
-    partway through loading or generation, not as a clean error at
-    startup. `load_in_4bit` cuts each model's footprint by roughly 4x at
-    some quality/speed cost; see the LOAD_IN_4BIT env vars in
-    forensic_agent.py / profiler_agent.py to control this per-agent.
+    Load via unsloth's FastVisionModel.
+
+    Known gotcha: for some model repos (custom fine-tunes especially —
+    e.g. Kizzington/Qwen3-VL-8B-Thinking-heretic), unsloth's internal
+    processor auto-detection can fail to match `model_type` to a known
+    processor class and silently return `processor=None` instead of
+    raising — you'll see
+        "Unsloth: Warning - VLM processor fallback returned None for
+        model_type=..."
+    in the logs right when this happens. If we don't catch that here,
+    the None processor gets returned as if everything were fine, and
+    the actual crash happens much later and far away from the cause —
+    typically an opaque `AttributeError: 'NoneType' object has no
+    attribute 'apply_chat_template'` (or similar) deep in a generation
+    call, which looks nothing like a processor-loading problem. So:
+    explicitly recover with a plain `AutoProcessor.from_pretrained`
+    call when unsloth hands back None, and raise a clear, specific
+    error immediately if even that fails — right here, not three
+    layers of call stack later.
     """
     model, processor = FastVisionModel.from_pretrained(
         local_path,
@@ -96,6 +106,20 @@ def _load_with_unsloth(local_path: str, processor_path: Optional[str], load_in_4
 
     if processor_path:
         processor = AutoProcessor.from_pretrained(processor_path)
+    elif processor is None:
+        try:
+            processor = AutoProcessor.from_pretrained(local_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"Model loaded successfully, but no processor could be "
+                f"obtained for {local_path!r}: unsloth's own processor "
+                f"auto-detection returned None (see the 'VLM processor "
+                f"fallback returned None' warning above this error), and "
+                f"the AutoProcessor.from_pretrained fallback also failed "
+                f"with: {e!r}. Pass an explicit `processor_path` to "
+                f"make_model() pointing at a repo/path with a compatible "
+                f"processor config for this model."
+            ) from e
 
     return model, processor
 

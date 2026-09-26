@@ -6,6 +6,7 @@ import os
 import asyncio
 import logging
 import mimetypes
+import re
 import socket
 import subprocess
 import sys
@@ -521,31 +522,74 @@ async def step_forensic_rag(task_id: str, forensic_report: str) -> dict:
     return rag_data
 
 
+_SENTENCE_END_RE = re.compile(r'[.!?"\')\]]\s*$')
+_SENTENCE_START_RE = re.compile(r'^[A-Z0-9"\'(#]')
+
+
+def _mark_excerpt_boundaries(text: str) -> str:
+    """
+    Prefix/suffix a chunk with an ellipsis if it doesn't land on a
+    clean sentence boundary, so a genuine mid-sentence excerpt reads
+    as "this continues before/after" rather than looking like the
+    text randomly stops. RecursiveCharacterTextSplitter now prefers
+    sentence-ending separators (see octen_rag.py) so this should be
+    the exception rather than the rule, but long technical sentences
+    can still occasionally exceed chunk_size.
+    """
+    text = text.strip()
+    if not text:
+        return text
+    if not _SENTENCE_START_RE.match(text):
+        text = "…" + text
+    if not _SENTENCE_END_RE.search(text):
+        text = text + "…"
+    return text
+
+
 def format_rag_section(rag_data: dict) -> str:
     """
-    Render RAG grounding results as clean Markdown — just the
-    retrieved reference text itself, no retrieval-QA mechanics
-    (query string, per-chunk similarity scores, trigger source) since
-    those are retrieval-internal detail, not part of the answer a
-    reader actually wants to see.
+    Render RAG grounding results as clean Markdown, grouped by source
+    file and — within each file — restored to the reference material's
+    own original order rather than left in FAISS's raw similarity-score
+    order.
+
+    Score order is right for RANKING which chunks to keep, but wrong
+    for READING them: top_k=5 chunks can come from several different
+    forensic_knowledge/*.md files and land in an arbitrary interleaved
+    order (e.g. a gunshot-wounds passage, then an asphyxia passage,
+    then back to gunshot-wounds), which reads as disjointed even though
+    each individual chunk is a legitimate match. Grouping by source
+    (each group heading ordered by that source's best-scoring chunk,
+    so the most relevant topic still leads) and sorting each group's
+    chunks by their original position in the file fixes that, without
+    losing the relevance ranking that got them retrieved in the first
+    place.
     """
     if not rag_data["triggered"]:
         return "_Not triggered — Forensic report's 'Evidence of Trauma' section said No._"
 
-    seen_sources: list[str] = []
-    passages: list[str] = []
+    by_source: dict[str, list[dict]] = {}
+    source_order: list[str] = []
     for r in rag_data["results"]:
-        source = r.get("source")
-        if source and source not in seen_sources:
-            seen_sources.append(source)
-        text = r.get("text", "").strip()
-        if text:
-            passages.append(text)
+        if not r.get("text", "").strip():
+            continue
+        source = r.get("source", "unknown")
+        if source not in by_source:
+            by_source[source] = []
+            source_order.append(source)  # first appearance = best score for this source
+        by_source[source].append(r)
 
-    body = "\n\n".join(passages) if passages else "_No matching reference material found._"
-    if seen_sources:
-        body += f"\n\n*Reference: {', '.join(seen_sources)}*"
-    return body
+    if not source_order:
+        return "_No matching reference material found._"
+
+    sections = []
+    for source in source_order:
+        chunks = sorted(by_source[source], key=lambda r: r.get("chunk_index", 0))
+        title = Path(source).stem.replace("_", " ").replace("-", " ").strip().title()
+        body = "\n\n".join(_mark_excerpt_boundaries(c["text"]) for c in chunks)
+        sections.append(f"### {title}\n*(source: {source})*\n\n{body}")
+
+    return "\n\n---\n\n".join(sections)
 
 
 async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_data: dict | None = None):

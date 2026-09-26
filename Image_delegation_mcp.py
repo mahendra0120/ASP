@@ -317,6 +317,19 @@ async def log_event(level: str, source: str, message: str) -> dict:
 
 if __name__ == "__main__":
     print(f"MCP Vision-Tools server  :{MCP_PORT}")
+    # Invalidate any cached FAISS index from a previous run by default —
+    # see octen_rag.clear_index_cache()'s docstring for why: a stale
+    # cache built with older chunking logic (or an older corpus) was
+    # otherwise silently reused instead of picked up. This just deletes
+    # the cache; the first real rag_search call after startup rebuilds
+    # it lazily (a few seconds for the current small corpus). Set
+    # RAG_REBUILD_ON_STARTUP=false once you're not actively iterating
+    # on forensic_knowledge/*.md or octen_rag.py's chunking logic.
+    if os.getenv("RAG_REBUILD_ON_STARTUP", "true").strip().lower() not in ("false", "0", "no"):
+        if _octen_rag.clear_index_cache():
+            print("[MCP] Cleared cached RAG index (.octen_faiss_index/) — will rebuild on first rag_search call.")
+        else:
+            print("[MCP] No cached RAG index found — will build fresh on first rag_search call.")
     try:
         mcp.run(transport="sse", port=MCP_PORT)
     finally:

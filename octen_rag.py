@@ -149,14 +149,32 @@ def build_embeddings(
 
 def load_forensic_knowledge_documents(
     knowledge_dir: Path = FORENSIC_KNOWLEDGE_DIR,
-    chunk_size: int = 800,
-    chunk_overlap: int = 100,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 150,
 ) -> list[Document]:
     """
     Load every *.md file under forensic_knowledge/ and split each into
     LangChain Document chunks, tagged with the source filename (e.g.
     "Gunshot_wounds.md") so retrieval results can cite which reference
     a chunk came from.
+
+    Each chunk also gets a `chunk_index` (its position within that
+    file, in original reading order) — main.py's format_rag_section
+    uses this to re-sort retrieved chunks back into document order
+    instead of leaving them in FAISS's similarity-score order, which
+    otherwise interleaves unrelated topics arbitrarily and reads as
+    disjointed.
+
+    Explicit `separators` (sentence-ending punctuation before falling
+    back to a bare space) bias the splitter toward cutting at sentence
+    boundaries rather than mid-sentence — chunk_size=800 (the old
+    default) was tight enough that dense forensic-pathology prose,
+    which often runs long without a paragraph break, would routinely
+    hit the split point mid-sentence. 1200 gives more room to find a
+    natural break; format_rag_section also visibly marks with an
+    ellipsis any chunk that still doesn't land on one, so a genuine
+    excerpt reads as an intentional excerpt rather than an unexplained
+    cutoff.
     """
     if not knowledge_dir.exists():
         return []
@@ -164,6 +182,7 @@ def load_forensic_knowledge_documents(
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""],
     )
 
     docs: list[Document] = []
@@ -171,8 +190,11 @@ def load_forensic_knowledge_documents(
         text = md_path.read_text(encoding="utf-8", errors="ignore")
         if not text.strip():
             continue
-        for chunk in splitter.split_text(text):
-            docs.append(Document(page_content=chunk, metadata={"source": md_path.name}))
+        for i, chunk in enumerate(splitter.split_text(text)):
+            docs.append(Document(
+                page_content=chunk,
+                metadata={"source": md_path.name, "chunk_index": i},
+            ))
     return docs
 
 
@@ -276,6 +298,41 @@ def rebuild_index(embeddings=None) -> None:
     get_vectorstore(embeddings=embeddings, force_rebuild=True)
 
 
+def clear_index_cache() -> bool:
+    """
+    Delete the on-disk FAISS index cache (.octen_faiss_index/) without
+    immediately rebuilding it — the next get_vectorstore()/query() call
+    will build a fresh one from whatever's currently in
+    forensic_knowledge/*.md (+ skills/rag_corpus.json if present).
+
+    Unlike rebuild_index(), this doesn't force the (blocking) embedding
+    pass to happen right now — it just invalidates the cache so the
+    first real rag_search call after startup is guaranteed to reflect
+    the current corpus + current chunking logic, rather than whatever
+    was on disk from a previous run (which is exactly the trap that
+    bit chunk_index: the code changed, but a stale cached index kept
+    getting silently reused instead of being rebuilt).
+
+    Called automatically on every MCP server startup — see
+    Image_delegation_mcp.py — gated by RAG_REBUILD_ON_STARTUP (default
+    "true"). Set that to "false" once you're not actively iterating on
+    forensic_knowledge/*.md or this file's chunking logic, since
+    re-embedding the whole corpus on every restart is unnecessary
+    (if slight) startup overhead once things have stabilized.
+
+    Returns True if a cache was found and removed, False if there was
+    nothing to clear (also resets the in-memory _vectorstore, in case
+    this is called from the same process that has one loaded).
+    """
+    import shutil
+    global _vectorstore
+    _vectorstore = None
+    if INDEX_DIR.exists():
+        shutil.rmtree(INDEX_DIR)
+        return True
+    return False
+
+
 # ════════════════════════════════════════════════════════════════
 #  Query — drop-in replacement for the old TF-IDF rag_search()
 # ════════════════════════════════════════════════════════════════
@@ -301,9 +358,10 @@ def query(text: str, top_k: int = 5) -> dict:
         if not doc.page_content:
             continue
         results.append({
-            "text":   doc.page_content,
-            "source": doc.metadata.get("source", "unknown"),
-            "score":  round(1.0 / (1.0 + float(distance)), 4),
+            "text":        doc.page_content,
+            "source":      doc.metadata.get("source", "unknown"),
+            "chunk_index": doc.metadata.get("chunk_index", 0),
+            "score":       round(1.0 / (1.0 + float(distance)), 4),
         })
 
     corpus_size = store.index.ntotal if hasattr(store, "index") else len(results)
