@@ -41,6 +41,9 @@ import httpx
 from mcp.server.mcpserver import MCPServer
 
 import db
+import octen_rag as _octen_rag  # shared keyword-trigger + RAG logic
+
+DEFAULT_TRIGGER_KEYWORDS = ["cause", "manner"]
 
 MCP_PORT      = int(os.getenv("MCP_SERVER_PORT",      "9000"))
 PROFILER_PORT = int(os.getenv('PROFILER_AGENT_PORT', '8011'))
@@ -315,38 +318,12 @@ async def log_event(level: str, source: str, message: str) -> dict:
 #  Entrypoint
 # ════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    print(f"MCP Vision-Tools server  :{MCP_PORT}")
-    # Invalidate any cached FAISS index from a previous run by default —
-    # see octen_rag.clear_index_cache()'s docstring for why: a stale
-    # cache built with older chunking logic (or an older corpus) was
-    # otherwise silently reused instead of picked up. This just deletes
-    # the cache; the first real rag_search call after startup rebuilds
-    # it lazily (a few seconds for the current small corpus). Set
-    # RAG_REBUILD_ON_STARTUP=false once you're not actively iterating
-    # on forensic_knowledge/*.md or octen_rag.py's chunking logic.
-    if os.getenv("RAG_REBUILD_ON_STARTUP", "true").strip().lower() not in ("false", "0", "no"):
-        if _octen_rag.clear_index_cache():
-            print("[MCP] Cleared cached RAG index (.octen_faiss_index/) — will rebuild on first rag_search call.")
-        else:
-            print("[MCP] No cached RAG index found — will build fresh on first rag_search call.")
-    try:
-        mcp.run(transport="sse", port=MCP_PORT)
-    finally:
-        asyncio.run(db.close_pool())
-
-
 # ════════════════════════════════════════════════════════════════
 #  Tool 9 — Keyword trigger scanner
 #
 #  Used by the Profiler Agent to decide whether its own result text
 #  warrants a rag_search call for grounded knowledge.
 # ════════════════════════════════════════════════════════════════
-
-import octen_rag as _octen_rag  # shared keyword-trigger + RAG logic
-
-DEFAULT_TRIGGER_KEYWORDS = ["cause", "manner"]
-
 
 @mcp.tool()
 async def check_keyword_triggers(
@@ -427,3 +404,41 @@ async def rebuild_octen_index() -> dict:
     store = await asyncio.to_thread(_octen_rag.get_vectorstore)
     size = store.index.ntotal if hasattr(store, "index") else 0
     return {"rebuilt": True, "corpus_size": size}
+
+
+# ════════════════════════════════════════════════════════════════
+#  Entrypoint
+#
+#  IMPORTANT: this must stay the LAST thing in the file. mcp.run()
+#  below blocks synchronously until the server shuts down, so any
+#  @mcp.tool() registration placed AFTER this block would never
+#  execute during a normal run — which is exactly the bug that used
+#  to live here: check_keyword_triggers, rag_search, and
+#  rebuild_octen_index (plus the octen_rag import and
+#  DEFAULT_TRIGGER_KEYWORDS they need) were previously defined after
+#  this block, so those three tools were silently never registered
+#  with the running server in any actual launch, even though the code
+#  looked correct on its own. That import is now at the top of the
+#  file with the other imports, and every @mcp.tool() definition now
+#  runs before we ever reach mcp.run() here.
+# ════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print(f"MCP Vision-Tools server  :{MCP_PORT}")
+    # Invalidate any cached FAISS index from a previous run by default —
+    # see octen_rag.clear_index_cache()'s docstring for why: a stale
+    # cache built with older chunking logic (or an older corpus) was
+    # otherwise silently reused instead of picked up. This just deletes
+    # the cache; the first real rag_search call after startup rebuilds
+    # it lazily (a few seconds for the current small corpus). Set
+    # RAG_REBUILD_ON_STARTUP=false once you're not actively iterating
+    # on forensic_knowledge/*.md or octen_rag.py's chunking logic.
+    if os.getenv("RAG_REBUILD_ON_STARTUP", "true").strip().lower() not in ("false", "0", "no"):
+        if _octen_rag.clear_index_cache():
+            print("[MCP] Cleared cached RAG index (.octen_faiss_index/) — will rebuild on first rag_search call.")
+        else:
+            print("[MCP] No cached RAG index found — will build fresh on first rag_search call.")
+    try:
+        mcp.run(transport="sse", port=MCP_PORT)
+    finally:
+        asyncio.run(db.close_pool())
