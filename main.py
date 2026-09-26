@@ -35,7 +35,8 @@ load_dotenv()
 
 # Global variables
 mcp_proc = None
-a2a_proc = None
+profiler_proc = None
+forensic_proc = None
 REPO_ROOT = Path(__file__).resolve().parent
 TEMP_IMAGE_DIR = Path("temp_uploads")
 TEMP_IMAGE_DIR.mkdir(exist_ok=True)
@@ -101,46 +102,75 @@ def _process_alive(proc: subprocess.Popen | None) -> bool:
     return proc is not None and proc.poll() is None
 
 
+# Loading a ~8B-parameter vision-language checkpoint (even at 4-bit —
+# see qwen_agents/model_utils.py) through unsloth is a lot slower than a
+# typical web-service startup, especially on a cold cache or modest
+# GPU/CPU. 60s was tuned for "did the process fail to bind a socket",
+# not "is a multi-billion-parameter model still loading" — those are
+# different questions with different acceptable timeouts. Configurable
+# via env var so it can be tuned per-machine without editing code.
+SERVER_READY_TIMEOUT = float(os.getenv("SERVER_READY_TIMEOUT_SECONDS", "300"))
+
+
 def launch_servers():
     """
-    Start the MCP tools server and the combined Profiler+Forensic A2A
-    server as subprocesses, then actually verify they came up before
-    reporting success.
+    Start the MCP tools server, the Profiler A2A server, and the
+    Forensic A2A server as three SEPARATE subprocesses, then actually
+    verify they came up before reporting success.
 
-    Fixes over the previous version, which just called Popen() and
-    immediately reported "started" regardless of what actually
+    Profiler and Forensic used to be started together as a single
+    combined process (A2A_image_delegation_server.py, run via
+    asyncio.gather). That process loads both agents' ~8B-parameter
+    checkpoints at import time, sequentially, before either uvicorn
+    server binds its port — so:
+      - Startup routinely exceeded the old 60s timeout for BOTH ports
+        at once, even when nothing was actually broken (just still
+        loading).
+      - A crash loading or running either model (e.g. a CUDA OOM from
+        two full-precision ~8B models sharing one GPU) took the other
+        agent down with it, since they were one OS process.
+    Running A2A_profiler_server.py and A2A_forensic_server.py as two
+    separate processes fixes both: their model loads now happen in
+    parallel instead of one after the other, and a crash in one is
+    isolated to that one port/process — the other keeps serving, and
+    the failure is reported against the specific process that died
+    rather than a shared, ambiguous one.
+
+    Other fixes over the original version, which just called Popen()
+    and immediately reported "started" regardless of what actually
     happened:
       - Uses absolute paths (REPO_ROOT / "<file>.py") and sets `cwd`
         explicitly, so this no longer depends on whatever directory
-        the Gradio app process happens to have been launched from —
-        a relative "Image_delegation_mcp.py" silently fails to be
-        found (and used to just report a generic launch error, or
-        nothing at all) if main.py isn't run with the repo root as
-        the working directory.
+        the Gradio app process happens to have been launched from.
       - Refuses to double-launch if a server from a previous click is
         still alive.
-      - Captures each subprocess's stdout/stderr to a log file (rather
-        than an unread PIPE, which can eventually deadlock a
+      - Captures each subprocess's stdout/stderr to its own log file
+        (rather than an unread PIPE, which can eventually deadlock a
         subprocess once its output buffer fills) and polls the actual
-        ports until they're open (or a fixed timeout elapses),
+        ports until they're open (or SERVER_READY_TIMEOUT elapses),
         reporting per-service success/failure instead of a blanket
         "started".
     """
-    global mcp_proc, a2a_proc
+    global mcp_proc, profiler_proc, forensic_proc
 
-    if _process_alive(mcp_proc) and _process_alive(a2a_proc):
+    if _process_alive(mcp_proc) and _process_alive(profiler_proc) and _process_alive(forensic_proc):
         return "ℹ️ Servers already running — stop them first if you want to restart."
 
     mcp_script = REPO_ROOT / "Image_delegation_mcp.py"
-    a2a_script = REPO_ROOT / "A2A_image_delegation_server.py"
-    missing = [p.name for p in (mcp_script, a2a_script) if not p.exists()]
+    profiler_script = REPO_ROOT / "A2A_profiler_server.py"
+    forensic_script = REPO_ROOT / "A2A_forensic_server.py"
+    missing = [p.name for p in (mcp_script, profiler_script, forensic_script) if not p.exists()]
     if missing:
         return f"❌ Server launch failed: missing file(s) in {REPO_ROOT}: {', '.join(missing)}"
 
     log_dir = REPO_ROOT / "server_logs"
     log_dir.mkdir(exist_ok=True)
-    mcp_log = open(log_dir / "mcp_server.log", "a")
-    a2a_log = open(log_dir / "a2a_server.log", "a")
+    mcp_logfile = log_dir / "mcp_server.log"
+    profiler_logfile = log_dir / "profiler_server.log"
+    forensic_logfile = log_dir / "forensic_server.log"
+    mcp_log = open(mcp_logfile, "a")
+    profiler_log = open(profiler_logfile, "a")
+    forensic_log = open(forensic_logfile, "a")
 
     try:
         mcp_proc = subprocess.Popen(
@@ -148,9 +178,14 @@ def launch_servers():
             stdout=mcp_log, stderr=subprocess.STDOUT,
             cwd=str(REPO_ROOT),
         )
-        a2a_proc = subprocess.Popen(
-            [sys.executable, str(a2a_script)],
-            stdout=a2a_log, stderr=subprocess.STDOUT,
+        profiler_proc = subprocess.Popen(
+            [sys.executable, str(profiler_script)],
+            stdout=profiler_log, stderr=subprocess.STDOUT,
+            cwd=str(REPO_ROOT),
+        )
+        forensic_proc = subprocess.Popen(
+            [sys.executable, str(forensic_script)],
+            stdout=forensic_log, stderr=subprocess.STDOUT,
             cwd=str(REPO_ROOT),
         )
     except Exception as e:
@@ -158,31 +193,34 @@ def launch_servers():
 
     ready = _wait_for_ports(
         {"MCP": MCP_PORT, "Profiler": PROFILER_PORT, "Forensic": FORENSIC_PORT},
-        timeout=60.0,
+        timeout=SERVER_READY_TIMEOUT,
     )
 
     # A process that already exited tells us more than "port never opened"
     # — surface that explicitly, and point at the log file to read why.
+    # Each service now has its own process and its own log file, so this
+    # correctly attributes a Forensic crash to Forensic alone instead of
+    # implicating Profiler too.
     lines = []
     for label, port, proc, logfile in (
-        ("MCP", MCP_PORT, mcp_proc, log_dir / "mcp_server.log"),
-        ("Profiler", PROFILER_PORT, a2a_proc, log_dir / "a2a_server.log"),
-        ("Forensic", FORENSIC_PORT, a2a_proc, log_dir / "a2a_server.log"),
+        ("MCP", MCP_PORT, mcp_proc, mcp_logfile),
+        ("Profiler", PROFILER_PORT, profiler_proc, profiler_logfile),
+        ("Forensic", FORENSIC_PORT, forensic_proc, forensic_logfile),
     ):
         if ready.get(label):
             lines.append(f"✅ {label}:{port}")
         elif not _process_alive(proc):
             lines.append(f"❌ {label}:{port} — process exited early (see {logfile})")
         else:
-            lines.append(f"⚠️ {label}:{port} — not responding after 60s (see {logfile})")
+            lines.append(f"⚠️ {label}:{port} — not responding after {int(SERVER_READY_TIMEOUT)}s (see {logfile})")
 
     return "\n".join(lines)
 
 
 def stop_servers():
-    global mcp_proc, a2a_proc
+    global mcp_proc, profiler_proc, forensic_proc
     stopped = []
-    for name, proc in (("MCP", mcp_proc), ("A2A (Profiler+Forensic)", a2a_proc)):
+    for name, proc in (("MCP", mcp_proc), ("Profiler", profiler_proc), ("Forensic", forensic_proc)):
         if proc:
             proc.terminate()
             try:
@@ -191,7 +229,8 @@ def stop_servers():
                 proc.kill()
             stopped.append(name)
     mcp_proc = None
-    a2a_proc = None
+    profiler_proc = None
+    forensic_proc = None
     return f"🛑 Stopped: {', '.join(stopped)}" if stopped else "ℹ️ No servers were running."
 
 

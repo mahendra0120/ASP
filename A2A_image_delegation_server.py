@@ -1,3 +1,12 @@
+# NOTE: main.py's launch_servers() no longer launches THIS script by
+# default — it now launches A2A_profiler_server.py and
+# A2A_forensic_server.py as two separate processes instead, so a crash
+# in one agent can't take the other down, and their model loads happen
+# in parallel rather than sequentially in one process (see those files'
+# docstrings for the full reasoning). This combined script is kept
+# around for anyone who deliberately wants both agents in a single
+# process (e.g. simpler process management when VRAM isn't a concern).
+
 import os
 import asyncio
 import uvicorn

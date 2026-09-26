@@ -42,6 +42,13 @@ PROFILER_MODEL_ID = os.getenv(
     "PROFILER_MODEL_ID", "Kizzington/Qwen3-VL-8B-Thinking-heretic"
 )
 
+# See FORENSIC_LOAD_IN_4BIT in forensic_agent.py — same reasoning, now
+# defaulting to full precision since 96GB comfortably covers both
+# ~8B models' combined weights + activation overhead.
+PROFILER_LOAD_IN_4BIT = os.getenv("PROFILER_LOAD_IN_4BIT", "false").strip().lower() not in (
+    "false", "0", "no",
+)
+
 # Sandbox root: only this agent's skills folder, nothing else on disk.
 SKILLS_DIR = Path(__file__).parent / ".agents" / "skills"
 CBA_SKILL_DIR = SKILLS_DIR / "criminal-behavioral-analysis"
@@ -137,6 +144,7 @@ profile_agent: Agent[None, str] = Agent(
         # either way, but a bigger budget is the actual fix: it lets
         # this agent reliably finish reasoning AND write its answer.
         max_new_tokens=12288,
+        load_in_4bit=PROFILER_LOAD_IN_4BIT,
     ),
     system_prompt=(
         "You are a criminal behavioral profiler analyzing case images plus "

@@ -59,10 +59,23 @@ FORENSIC_MODEL_ID = os.getenv(
     "mahendra0120/Forensic-Agent-4.0-2026-09-08_14.31.12",
 )
 
+# Profiler + Forensic both load a ~8B-parameter VL checkpoint into the
+# SAME process/GPU (see A2A_image_delegation_server.py). Two ~8B models
+# at full precision is roughly 32GB in weights alone — comfortably
+# inside a 96GB GPU even with activation/KV-cache overhead, so this
+# defaults to full precision. Set FORENSIC_LOAD_IN_4BIT=true if you're
+# on a smaller card and need the ~4x memory cut instead.
+FORENSIC_LOAD_IN_4BIT = os.getenv("FORENSIC_LOAD_IN_4BIT", "false").strip().lower() not in (
+    "false", "0", "no",
+)
 
 # No toolsets — no MCP servers of any kind are attached to this agent.
 forensic_agent: Agent[None, str] = Agent(
-    model=make_model(FORENSIC_MODEL_ID, max_new_tokens=6144),
+    model=make_model(
+        FORENSIC_MODEL_ID,
+        max_new_tokens=6144,
+        load_in_4bit=FORENSIC_LOAD_IN_4BIT,
+    ),
     system_prompt=(
         "You are a forensic pathology assistant. You are given only "
         "autopsy photographs — no written report, case file, or "

@@ -76,15 +76,21 @@ def _download(repo_id: str) -> str:
     return snapshot_download(repo_id=repo_id, token=os.getenv("HF_TOKEN"))
 
 
-def _load_with_unsloth(local_path: str, processor_path: Optional[str]):
+def _load_with_unsloth(local_path: str, processor_path: Optional[str], load_in_4bit: bool):
     """
-    Load via unsloth's FastVisionModel — full precision (no 4-bit
-    quantization), which is faster/lighter to run inference through
-    than plain transformers thanks to unsloth's fused kernels.
+    Load via unsloth's FastVisionModel. Full precision is faster/lighter
+    to run inference through than plain transformers thanks to unsloth's
+    fused kernels, but two ~8B-parameter VL checkpoints at full precision
+    sharing one GPU (Profiler + Forensic both run in this process) can
+    easily exceed available VRAM — that shows up as a CUDA OOM crash
+    partway through loading or generation, not as a clean error at
+    startup. `load_in_4bit` cuts each model's footprint by roughly 4x at
+    some quality/speed cost; see the LOAD_IN_4BIT env vars in
+    forensic_agent.py / profiler_agent.py to control this per-agent.
     """
     model, processor = FastVisionModel.from_pretrained(
         local_path,
-        load_in_4bit=False,
+        load_in_4bit=load_in_4bit,
     )
     FastVisionModel.for_inference(model)  # enable unsloth's fast inference path
 
@@ -95,10 +101,16 @@ def _load_with_unsloth(local_path: str, processor_path: Optional[str]):
 
 
 @lru_cache(maxsize=4)
-def _load(model_id: str, adapter_path: Optional[str], processor_path: Optional[str]):
-    """Load (and cache) the model + processor for a given model_id, via unsloth."""
+def _load(model_id: str, adapter_path: Optional[str], processor_path: Optional[str], load_in_4bit: bool):
+    """Load (and cache) the model + processor for a given model_id, via unsloth.
+
+    `load_in_4bit` is part of the cache key (not just a call-time knob)
+    so a model requested once in 4-bit and once in full precision are
+    correctly treated as two distinct loads rather than silently
+    reusing whichever was loaded first.
+    """
     local_path = _download(model_id)
-    model, processor = _load_with_unsloth(local_path, processor_path)
+    model, processor = _load_with_unsloth(local_path, processor_path, load_in_4bit)
 
     if adapter_path:
         model.load_adapter(adapter_path)
@@ -321,11 +333,14 @@ def make_model(
     temperature: float = 0.15,
     max_new_tokens: int = 6144,
     reference_images: Optional[list] = None,
+    load_in_4bit: bool = False,
 ) -> FunctionModel:
     """
     Build a pydantic-ai `Model` backed by a local Qwen3-VL checkpoint,
-    loaded via unsloth's FastVisionModel (full precision, no 4-bit
-    quantization).
+    loaded via unsloth's FastVisionModel. Pass `load_in_4bit=True` (or
+    set the per-agent env var — see forensic_agent.py / profiler_agent.py)
+    to cut VRAM usage roughly 4x; leave False for full precision if you
+    have the VRAM headroom for both agents' models at once.
 
     Returns a `FunctionModel` (a model driven by plain Python
     callables) so `Agent(model=make_model(...))` works exactly like it
@@ -359,7 +374,7 @@ def make_model(
     """
 
     def _run(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
-        model, processor = _load(model_id, adapter_path, processor_path)
+        model, processor = _load(model_id, adapter_path, processor_path, load_in_4bit)
         inputs, tokenizer = _build_chat_and_inputs(
             model, processor, model_id, messages, agent_info, reference_images
         )
@@ -466,7 +481,7 @@ def make_model(
         past_think = False
 
         try:
-            model, processor = _load(model_id, adapter_path, processor_path)
+            model, processor = _load(model_id, adapter_path, processor_path, load_in_4bit)
             inputs, tokenizer = _build_chat_and_inputs(
                 model, processor, model_id, messages, agent_info, reference_images
             )
