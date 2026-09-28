@@ -1,0 +1,364 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..ac436ee
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,17 @@
++# Copy to .env and fill in real values — .env is gitignored, never commit it.
++#
++# HF_TOKEN is a credential: keep it in this file only, never in a
++# script. It's only used for the FIRST download of a private/gated
++# model repo; once weights are cached under HF_HOME the app runs with
++# HF_HUB_OFFLINE=1 and never touches it.
++HF_TOKEN=
++
++# Non-secret config. setup_env.sh already sets these — only override
++# here if your setup differs.
++HF_HOME=/workspace/hf_cache
++PROFILER_AGENT_PORT=8011
++FORENSIC_AGENT_PORT=8002
++
++# db.py's result store. Matches the credentials in setup_postgres.sh;
++# db.py defaults to this same URL if unset.
++DATABASE_URL=postgresql://asp_user:asp_password@localhost:5432/asp
+diff --git a/README.md b/README.md
+index e69de29..2fa897c 100644
+--- a/README.md
++++ b/README.md
+@@ -0,0 +1,64 @@
++# ASP — Agentic Serial-crime Profiler
++
++A two-agent Qwen3-VL pipeline (Forensic agent → Profiler agent, wired
++together over A2A) that turns case images into a forensic report and
++a behavioral profile. An MCP filesystem server backs the Profiler
++agent's skill files, results are stored in PostgreSQL, and a local RAG
++lookup runs over `forensic_knowledge/`.
++
++## Running on RunPod
++
++**Pod requirements**
++- A GPU pod with a **network volume mounted at `/workspace`** (model
++  weights, the uv/npm caches and Postgres backups live there so they
++  survive pod restarts).
++- HTTP port **7860** exposed in the pod settings (that's the Gradio UI;
++  you'll reach it through RunPod's proxy URL for that port).
++- Any Ubuntu-based image with an NVIDIA driver. Running as root without
++  `sudo` is fine — the scripts handle both.
++
++**First run**
++```bash
++cd /workspace
++git clone https://github.com/mahendra0120/ASP.git
++cd ASP
++cp .env.example .env        # set HF_TOKEN if either model repo is private/gated
++bash start.sh
++```
++
++**After every pod restart** — just run `bash start.sh` again. It is
++idempotent and does, in order:
++
++| Step | Script | What it does |
++|---|---|---|
++| 1 | `setup_env.sh` | Installs Node/`npx` + `uv` if missing, points the HF / uv / npm caches at `/workspace`, pre-installs the MCP filesystem server, exports the env vars |
++| 2 | `setup_postgres.sh` | Installs/starts Postgres, creates the `asp` role + DB, restores the latest backup, starts the background backup loop |
++| 3 | `uv sync --frozen` | Installs Python deps (fast after the first run — cached on the volume) |
++| 4 | `main.py` | Launches the MCP + Profiler + Forensic servers and the Gradio UI |
++
++**Environment variables** (set by `setup_env.sh`)
++
++| Var | Value |
++|---|---|
++| `HF_HOME` | `/workspace/hf_cache` |
++| `HF_HUB_OFFLINE` | `1` once the cache has models; left unset on an empty cache so the first run can download |
++| `PROFILER_AGENT_PORT` | `8011` |
++| `FORENSIC_AGENT_PORT` | `8002` |
++
++`HF_TOKEN` is a credential and lives only in `.env` (gitignored) —
++never in a script or committed file. It's only needed for the first
++download of a private/gated repo; once weights are cached the app runs
++offline and the token isn't used.
++
++**Logs** — `server_logs/{mcp,profiler,forensic}_server.log`. They are
++deleted and recreated on every launch, so they only ever contain the
++current run. If the Profiler fails, its traceback is in
++`profiler_server.log`.
++
++**Database backups** — a snapshot is written to
++`/workspace/pg-backups/latest.dump` every 5 minutes. Run
++`bash backup_postgres.sh` for an immediate one before deliberately
++stopping the pod.
++
++`setup_env.sh` must be **sourced** (`source setup_env.sh`), not
++executed, if you run it by hand; `start.sh` does that for you.
+diff --git a/backup_postgres.sh b/backup_postgres.sh
+old mode 100644
+new mode 100755
+index a4c8d29..d302462
+--- a/backup_postgres.sh
++++ b/backup_postgres.sh
+@@ -15,7 +15,14 @@ BACKUP_DIR="/workspace/pg-backups"
+ BACKUP_FILE="${BACKUP_DIR}/latest.dump"
+ 
+ mkdir -p "$BACKUP_DIR"
+-sudo -u postgres pg_dump -Fc "${PG_DB}" -f "${BACKUP_FILE}.tmp"
++
++# Root on RunPod usually has no `sudo`; see setup_postgres.sh.
++if [ "$(id -u)" -eq 0 ]; then
++    PGRUN="runuser -u postgres --"
++else
++    PGRUN="sudo -u postgres"
++fi
++${PGRUN} pg_dump -Fc "${PG_DB}" -f "${BACKUP_FILE}.tmp"
+ mv "${BACKUP_FILE}.tmp" "$BACKUP_FILE"
+ 
+ echo "✅ Backup written to ${BACKUP_FILE}"
+diff --git a/main.py b/main.py
+index b73ee7e..ee57d0b 100644
+--- a/main.py
++++ b/main.py
+@@ -169,9 +169,22 @@ def launch_servers():
+     mcp_logfile = log_dir / "mcp_server.log"
+     profiler_logfile = log_dir / "profiler_server.log"
+     forensic_logfile = log_dir / "forensic_server.log"
+-    mcp_log = open(mcp_logfile, "a")
+-    profiler_log = open(profiler_logfile, "a")
+-    forensic_log = open(forensic_logfile, "a")
++
++    # Start each run with a clean slate: delete the previous run's log
++    # files before opening new ones. These used to be opened in append
++    # ("a") mode, so every restart just kept piling new output onto
++    # whatever the last run (successful or crashed) had already
++    # written — making it easy to misread an old crash's traceback as
++    # belonging to the current run, or to scroll past a huge log
++    # thinking nothing new was written. Deleting first (then opening
++    # in "w") guarantees each log file contains only the run that's
++    # about to start.
++    for logfile in (mcp_logfile, profiler_logfile, forensic_logfile):
++        logfile.unlink(missing_ok=True)
++
++    mcp_log = open(mcp_logfile, "w")
++    profiler_log = open(profiler_logfile, "w")
++    forensic_log = open(forensic_logfile, "w")
+ 
+     try:
+         mcp_proc = subprocess.Popen(
+diff --git a/setup_env.sh b/setup_env.sh
+new file mode 100755
+index 0000000..0cce05d
+--- /dev/null
++++ b/setup_env.sh
+@@ -0,0 +1,120 @@
++#!/usr/bin/env bash
++#
++# setup_env.sh  (RunPod)
++# ─────────────────────────────────────────────────────────────────
++# Prepares a RunPod pod for this repo. Safe to source repeatedly
++# (every step is a no-op if already done), and meant to be SOURCED so
++# the exports below land in your shell:
++#   source setup_env.sh
++#
++# What it does:
++#   1. Installs Node.js/npm (for `npx` — the Profiler agent's
++#      filesystem MCP server, see profiler_agent.py) and `uv`, if
++#      they're missing. Pod local disk is wiped on restart, so this
++#      re-runs (quickly) each time you start the pod.
++#   2. Keeps the big, slow-to-rebuild things on the /workspace network
++#      volume so they SURVIVE pod restarts: HF model weights, uv's
++#      Python + package cache, and the npm cache.
++#   3. Pre-fetches the MCP filesystem server package so the Profiler
++#      never has to reach the npm registry mid-request.
++#   4. Exports HF_HOME, HF_HUB_OFFLINE, PROFILER_AGENT_PORT,
++#      FORENSIC_AGENT_PORT.
++#
++# HF_TOKEN is intentionally NOT handled here — it's a credential.
++# Put it in .env (gitignored; see .env.example).
++
++(return 0 2>/dev/null) || {
++    echo "!! setup_env.sh must be SOURCED, not executed:"
++    echo "     source setup_env.sh"
++    exit 1
++}
++
++if [ ! -d /workspace ]; then
++    echo "!! /workspace not found — attach a RunPod network volume at /workspace"
++    echo "   (model weights, uv cache and DB backups all live there)."
++    return 1
++fi
++
++# RunPod pods run as root and often have no `sudo`.
++if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
++
++# ── Persistent caches on the network volume ────────────────────────
++export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
++export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.uv/cache}"
++export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/workspace/.uv/python}"
++# Network volumes usually can't hardlink from the cache into .venv;
++# copy explicitly instead of warning on every sync.
++export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
++export npm_config_cache="${npm_config_cache:-/workspace/.npm}"
++mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$npm_config_cache"
++
++# ── Base tools needed by the installers below ──────────────────────
++if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
++    echo ">> Installing curl/gnupg/ca-certificates..."
++    $SUDO apt-get update -y
++    $SUDO apt-get install -y --no-install-recommends curl ca-certificates gnupg
++fi
++
++# ── Node.js / npm (npx) ────────────────────────────────────────────
++# Requires Node >= 18; the distro `nodejs` package is often older, so
++# use NodeSource's current LTS.
++if ! command -v npx >/dev/null 2>&1; then
++    echo ">> Installing Node.js (npx not found on PATH)..."
++    curl -fsSL https://deb.nodesource.com/setup_lts.x | $SUDO bash -
++    $SUDO apt-get install -y nodejs
++else
++    echo ">> npx already installed ($(npx --version)) — skipping."
++fi
++
++# ── uv ──────────────────────────────────────────────────────────────
++export PATH="$HOME/.local/bin:$PATH"
++if ! command -v uv >/dev/null 2>&1; then
++    echo ">> Installing uv..."
++    curl -LsSf https://astral.sh/uv/install.sh | sh
++else
++    echo ">> uv already installed ($(uv --version)) — skipping."
++fi
++
++# ── Pre-fetch the Profiler's MCP filesystem server ─────────────────
++# profiler_agent.py spawns `npx -y @modelcontextprotocol/server-filesystem`
++# on demand with a 60s init timeout. Installing it up front means a
++# slow/blocked npm registry can't make that first request fail.
++if ! npm ls -g --depth=0 @modelcontextprotocol/server-filesystem >/dev/null 2>&1; then
++    echo ">> Pre-installing @modelcontextprotocol/server-filesystem..."
++    npm install -g @modelcontextprotocol/server-filesystem \
++        || echo "!! Pre-install failed — the Profiler will try npx at request time instead."
++fi
++
++# ── Ports ───────────────────────────────────────────────────────────
++export PROFILER_AGENT_PORT="${PROFILER_AGENT_PORT:-8011}"
++export FORENSIC_AGENT_PORT="${FORENSIC_AGENT_PORT:-8002}"
++
++# ── HF offline mode ────────────────────────────────────────────────
++# HF_HUB_OFFLINE=1 skips all Hub network calls, which is what you want
++# once weights are cached — but on a FRESH volume it would make the
++# very first model download fail. So: default to 1 only when the cache
++# already contains models; otherwise leave it off so the first run can
++# download. An explicit HF_HUB_OFFLINE in your environment always wins.
++if [ -z "${HF_HUB_OFFLINE+x}" ]; then
++    if ls -d "$HF_HOME"/hub/models--* >/dev/null 2>&1; then
++        export HF_HUB_OFFLINE=1
++    else
++        echo ">> HF cache is empty — leaving HF_HUB_OFFLINE off so weights can download."
++        echo "   (Set HF_TOKEN in .env first if either model repo is private/gated.)"
++        echo "   Re-source this script after the first run to switch to offline mode."
++    fi
++fi
++
++if [ ! -f "$(dirname "${BASH_SOURCE[0]}")/.env" ]; then
++    echo ">> No .env found — copy .env.example to .env and set HF_TOKEN if needed."
++fi
++
++echo ""
++echo "✅ Environment ready:"
++echo "   HF_HOME=${HF_HOME}"
++echo "   HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-<unset>}"
++echo "   PROFILER_AGENT_PORT=${PROFILER_AGENT_PORT}"
++echo "   FORENSIC_AGENT_PORT=${FORENSIC_AGENT_PORT}"
++echo "   npx: $(command -v npx || echo 'NOT FOUND')"
++echo "   uv:  $(command -v uv || echo 'NOT FOUND')"
++echo ""
+diff --git a/setup_postgres.sh b/setup_postgres.sh
+old mode 100644
+new mode 100755
+index 93091bc..6850a1f
+--- a/setup_postgres.sh
++++ b/setup_postgres.sh
+@@ -32,6 +32,14 @@ BACKUP_DIR="/workspace/pg-backups"
+ BACKUP_FILE="${BACKUP_DIR}/latest.dump"
+ BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-300}"   # 5 min default
+ 
++# RunPod pods run as root and frequently ship without `sudo`, so use
++# `runuser` when root and only fall back to `sudo` for non-root users.
++if [ "$(id -u)" -eq 0 ]; then
++    PGRUN="runuser -u postgres --"
++else
++    PGRUN="sudo -u postgres"
++fi
++
+ if [ ! -d /workspace ]; then
+     echo "!! /workspace not found — this script expects a RunPod network volume"
+     echo "   mounted at /workspace. Aborting."
+@@ -75,17 +83,17 @@ service postgresql start || pg_ctlcluster "${PG_VERSION}" "${PG_CLUSTER}" start
+ 
+ echo ">> Waiting for PostgreSQL to accept connections..."
+ for i in $(seq 1 30); do
+-    if sudo -u postgres pg_isready -q; then break; fi
++    if ${PGRUN} pg_isready -q; then break; fi
+     sleep 1
+ done
+ 
+ # ── Create role + database on first run only ──────────────────────
+ FRESH_CLUSTER=false
+-ROLE_EXISTS="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'")"
++ROLE_EXISTS="$(${PGRUN} psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'")"
+ if [ "$ROLE_EXISTS" != "1" ]; then
+     echo ">> Creating role '${PG_USER}' and database '${PG_DB}'..."
+-    sudo -u postgres psql -c "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASSWORD}';"
+-    sudo -u postgres createdb -O "${PG_USER}" "${PG_DB}"
++    ${PGRUN} psql -c "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASSWORD}';"
++    ${PGRUN} createdb -O "${PG_USER}" "${PG_DB}"
+     FRESH_CLUSTER=true
+ else
+     echo ">> Role '${PG_USER}' already exists — skipping creation"
+@@ -94,7 +102,7 @@ fi
+ # ── Restore the latest backup into a fresh cluster, if one exists ─
+ if [ "$FRESH_CLUSTER" = true ] && [ -f "$BACKUP_FILE" ]; then
+     echo ">> Found existing backup at ${BACKUP_FILE} — restoring..."
+-    sudo -u postgres pg_restore -d "${PG_DB}" --clean --if-exists "$BACKUP_FILE" \
++    ${PGRUN} pg_restore -d "${PG_DB}" --clean --if-exists "$BACKUP_FILE" \
+         && echo ">> Restore complete." \
+         || echo "!! Restore reported errors — check output above."
+ else
+@@ -110,7 +118,7 @@ if ! pgrep -f "pg_dump.*${PG_DB}.*autobackup-loop" >/dev/null 2>&1; then
+         # marker string 'autobackup-loop' below is just so pgrep can find this loop
+         while true; do
+             sleep ${BACKUP_INTERVAL_SECONDS}
+-            sudo -u postgres pg_dump -Fc '${PG_DB}' -f '${BACKUP_FILE}.tmp' \
++            ${PGRUN} pg_dump -Fc '${PG_DB}' -f '${BACKUP_FILE}.tmp' \
+                 && mv '${BACKUP_FILE}.tmp' '${BACKUP_FILE}' # autobackup-loop
+         done
+     " > "${BACKUP_DIR}/autobackup.log" 2>&1 &
+diff --git a/start.sh b/start.sh
+new file mode 100755
+index 0000000..8bc6f01
+--- /dev/null
++++ b/start.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++#
++# start.sh — one command to bring the whole stack up on a RunPod pod.
++#
++#   bash start.sh
++#
++# Run it from anywhere; it's safe to re-run after every pod restart
++# (each step skips work that's already done):
++#   1. setup_env.sh      → Node/npx, uv, caches on /workspace, env vars
++#   2. setup_postgres.sh → Postgres + role/db, restore latest backup,
++#                          start the background backup loop
++#   3. uv sync           → Python deps (persisted on the volume, so
++#                          only the first run is slow)
++#   4. main.py           → Gradio UI on :7860 (expose HTTP port 7860
++#                          in your pod settings to reach it)
++set -euo pipefail
++cd "$(dirname "${BASH_SOURCE[0]}")"
++
++# shellcheck disable=SC1091
++source ./setup_env.sh
++bash ./setup_postgres.sh
++
++echo ">> Syncing Python dependencies..."
++uv sync --frozen
++
++echo ">> Starting ASP (Gradio on 0.0.0.0:7860)..."
++exec uv run python main.py

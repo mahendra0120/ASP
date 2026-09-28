@@ -32,6 +32,14 @@ BACKUP_DIR="/workspace/pg-backups"
 BACKUP_FILE="${BACKUP_DIR}/latest.dump"
 BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-300}"   # 5 min default
 
+# RunPod pods run as root and frequently ship without `sudo`, so use
+# `runuser` when root and only fall back to `sudo` for non-root users.
+if [ "$(id -u)" -eq 0 ]; then
+    PGRUN="runuser -u postgres --"
+else
+    PGRUN="sudo -u postgres"
+fi
+
 if [ ! -d /workspace ]; then
     echo "!! /workspace not found — this script expects a RunPod network volume"
     echo "   mounted at /workspace. Aborting."
@@ -75,17 +83,17 @@ service postgresql start || pg_ctlcluster "${PG_VERSION}" "${PG_CLUSTER}" start
 
 echo ">> Waiting for PostgreSQL to accept connections..."
 for i in $(seq 1 30); do
-    if sudo -u postgres pg_isready -q; then break; fi
+    if ${PGRUN} pg_isready -q; then break; fi
     sleep 1
 done
 
 # ── Create role + database on first run only ──────────────────────
 FRESH_CLUSTER=false
-ROLE_EXISTS="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'")"
+ROLE_EXISTS="$(${PGRUN} psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'")"
 if [ "$ROLE_EXISTS" != "1" ]; then
     echo ">> Creating role '${PG_USER}' and database '${PG_DB}'..."
-    sudo -u postgres psql -c "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASSWORD}';"
-    sudo -u postgres createdb -O "${PG_USER}" "${PG_DB}"
+    ${PGRUN} psql -c "CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASSWORD}';"
+    ${PGRUN} createdb -O "${PG_USER}" "${PG_DB}"
     FRESH_CLUSTER=true
 else
     echo ">> Role '${PG_USER}' already exists — skipping creation"
@@ -94,7 +102,7 @@ fi
 # ── Restore the latest backup into a fresh cluster, if one exists ─
 if [ "$FRESH_CLUSTER" = true ] && [ -f "$BACKUP_FILE" ]; then
     echo ">> Found existing backup at ${BACKUP_FILE} — restoring..."
-    sudo -u postgres pg_restore -d "${PG_DB}" --clean --if-exists "$BACKUP_FILE" \
+    ${PGRUN} pg_restore -d "${PG_DB}" --clean --if-exists "$BACKUP_FILE" \
         && echo ">> Restore complete." \
         || echo "!! Restore reported errors — check output above."
 else
@@ -110,7 +118,7 @@ if ! pgrep -f "pg_dump.*${PG_DB}.*autobackup-loop" >/dev/null 2>&1; then
         # marker string 'autobackup-loop' below is just so pgrep can find this loop
         while true; do
             sleep ${BACKUP_INTERVAL_SECONDS}
-            sudo -u postgres pg_dump -Fc '${PG_DB}' -f '${BACKUP_FILE}.tmp' \
+            ${PGRUN} pg_dump -Fc '${PG_DB}' -f '${BACKUP_FILE}.tmp' \
                 && mv '${BACKUP_FILE}.tmp' '${BACKUP_FILE}' # autobackup-loop
         done
     " > "${BACKUP_DIR}/autobackup.log" 2>&1 &

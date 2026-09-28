@@ -169,9 +169,22 @@ def launch_servers():
     mcp_logfile = log_dir / "mcp_server.log"
     profiler_logfile = log_dir / "profiler_server.log"
     forensic_logfile = log_dir / "forensic_server.log"
-    mcp_log = open(mcp_logfile, "a")
-    profiler_log = open(profiler_logfile, "a")
-    forensic_log = open(forensic_logfile, "a")
+
+    # Start each run with a clean slate: delete the previous run's log
+    # files before opening new ones. These used to be opened in append
+    # ("a") mode, so every restart just kept piling new output onto
+    # whatever the last run (successful or crashed) had already
+    # written — making it easy to misread an old crash's traceback as
+    # belonging to the current run, or to scroll past a huge log
+    # thinking nothing new was written. Deleting first (then opening
+    # in "w") guarantees each log file contains only the run that's
+    # about to start.
+    for logfile in (mcp_logfile, profiler_logfile, forensic_logfile):
+        logfile.unlink(missing_ok=True)
+
+    mcp_log = open(mcp_logfile, "w")
+    profiler_log = open(profiler_logfile, "w")
+    forensic_log = open(forensic_logfile, "w")
 
     try:
         mcp_proc = subprocess.Popen(
