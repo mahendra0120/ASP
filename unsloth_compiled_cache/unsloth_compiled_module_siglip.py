@@ -176,12 +176,10 @@ from torch import Tensor
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
-from unsloth_zoo.temporary_patches.common import torch_compile
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from transformers.models.siglip.modeling_siglip import (Callable, np, torch, nn, init, ACT2FN, ALL_ATTENTION_FUNCTIONS, torch_int, SiglipTextConfig, SiglipVisionConfig)
 
-@torch_compile_with_fallback(fullgraph = False, dynamic = True, options = torch_compile_options)
+@torch.compiler.disable(recursive = False)
 def SiglipVisionEmbeddings_forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False) -> torch.Tensor:
     _, _, height, width = pixel_values.shape
     target_dtype = self.patch_embedding.weight.dtype
@@ -257,7 +255,7 @@ class SiglipVisionEmbeddings(nn.Module):
         return SiglipVisionEmbeddings_forward(self, pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
 
 
-@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)
+@torch.compiler.disable(recursive = False)
 def SiglipTextEmbeddings_forward(
     self,
     input_ids: torch.LongTensor | None = None,
@@ -306,7 +304,6 @@ class SiglipTextEmbeddings(nn.Module):
         return SiglipTextEmbeddings_forward(self, input_ids=input_ids, position_ids=position_ids, inputs_embeds=inputs_embeds)
 
 
-@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -408,7 +405,7 @@ class SiglipAttention(nn.Module):
         return SiglipAttention_forward(self, hidden_states=hidden_states, attention_mask=attention_mask, **kwargs)
 
 
-@torch_compile_with_fallback(fullgraph = False, dynamic = True, options = torch_compile_options)
+@torch.compiler.disable(recursive = False)
 def SiglipMLP_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     hidden_states = self.fc1(hidden_states)
     hidden_states = self.activation_fn(hidden_states)
@@ -427,7 +424,7 @@ class SiglipMLP(nn.Module):
         return SiglipMLP_forward(self, hidden_states=hidden_states)
 
 
-@torch_compile_with_fallback(fullgraph = False, dynamic = True, options = torch_compile_options)
+@torch.compiler.disable(recursive = False)
 def SiglipMultiheadAttentionPoolingHead_forward(self, hidden_state):
     batch_size = hidden_state.shape[0]
     probe = self.probe.repeat(batch_size, 1, 1)

@@ -34,6 +34,9 @@ import asyncio
 import logging
 import os
 import traceback
+import faulthandler
+
+faulthandler.enable()
 
 import uvicorn
 from fasta2a.pydantic_ai import _bridge
@@ -48,7 +51,8 @@ from qwen_agents.Profiler_agent.profiler_agent import profile_agent as profiler_
 PROFILER_PORT = int(os.getenv("PROFILER_AGENT_PORT", "8011"))
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    force=True,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 

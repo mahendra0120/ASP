@@ -255,7 +255,8 @@ class A2AClient:
         assembled: dict[str, str] = {}
         emitted_len: dict[str, int] = {}
 
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
+        stream_timeout = httpx.Timeout(self._timeout, read=1800.0)
+        async with httpx.AsyncClient(timeout=stream_timeout) as c:
             async with c.stream(
                 "POST", self.base_url, json=payload,
                 headers={"Content-Type": "application/json"},

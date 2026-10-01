@@ -73,6 +73,7 @@ FORENSIC_LOAD_IN_4BIT = os.getenv("FORENSIC_LOAD_IN_4BIT", "false").strip().lowe
 forensic_agent: Agent[None, str] = Agent(
     model=make_model(
         FORENSIC_MODEL_ID,
+        processor_path="Qwen/Qwen3-VL-8B-Thinking",
         max_new_tokens=6144,
         load_in_4bit=FORENSIC_LOAD_IN_4BIT,
     ),

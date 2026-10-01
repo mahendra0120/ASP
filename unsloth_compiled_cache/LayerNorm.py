@@ -71,6 +71,8 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from transformers.models.siglip.modeling_siglip import (np)
 
 def forward(self, input: Tensor) -> Tensor:
+    original_dtype = input.dtype
+    if self.weight is not None: input = input.to(self.weight.dtype)
     return F.layer_norm(
         input, self.normalized_shape, self.weight, self.bias, self.eps
-    ).to(input.dtype)
+    ).to(original_dtype)

@@ -11,6 +11,9 @@ import asyncio
 import logging
 import os
 import traceback
+import faulthandler
+
+faulthandler.enable()
 
 import uvicorn
 from fasta2a.pydantic_ai import _bridge
@@ -24,7 +27,8 @@ from qwen_agents.Forensic_agent.forensic_agent import forensic_agent
 FORENSIC_PORT = int(os.getenv("FORENSIC_AGENT_PORT", "8002"))
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    force=True,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
