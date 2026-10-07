@@ -4,15 +4,6 @@ Source: https://emedicine.medscape.com/article/1680282-overview?form=fpf
 
 ---
 
-processing....
-
-# Sudden Natural Death Pathology
-
-- Author: Kim A Collins, MD, FCAP; Chief Editor: J Scott Denton, MD more...
-- 11
-- Print
-- Feedback
-
 ## Overview
 
 Determination of cause of death in natural deaths, particularly when the death occurred suddenly, unexpectedly, or in the young, is an important part of forensic autopsy practice, for reasons including the following:
@@ -20,6 +11,11 @@ Determination of cause of death in natural deaths, particularly when the death o
 - Identification of disease processes and patterns provides epidemiological data that can be used to control disease outbreaks, identify emerging infectious disease or changes in disease patterns, or identify reportable diseases, such as meningococcal meningitis, so that close contacts can receive prophylactic treatment.
 - The timely and accurate diagnosis of medically important diseases can have a significant impact on the relatives of the deceased by allowing them the opportunity to seek treatment for certain hereditary diseases in which the presenting symptom may in fact be sudden death.
 - Finally, performance of an autopsy when there is no readily obvious cause of death can provide the deceased's family and friends with answers, thereby helping with the grieving process.
+- ME investigates sudden/unexpected deaths; young age + abrupt death ↑ autopsy likelihood.
+- Thorough autopsy + history review essential; external exam alone may suffice in select natural deaths.
+- Heart, lungs, brain most common sudden-death sites; cardiac disease leading cause >40y.
+- 10-19% sudden natural deaths remain unexplained; molecular autopsy may reveal genetic etiologies.
+- Avoid overcalling CAD; subtle trauma, toxins, infection, and resuscitation artifacts can mimic natural death.
 Autopsies are indispensable in determining the cause of sudden natural deaths. They not only provide a definitive diagnosis but also help in identifying risk factors associated with the disease. This information is crucial for epidemiological tracking and for guiding preventive measures. Even when a death appears to be due to a natural disease process, careful consideration must be given to potential nonnatural contributing factors that could alter the manner of death.
 Accidental or intentional injuries comprise the leading cause of death in individuals from ages 1-44 years; still, at least half of the deaths coming to the attention of medical examiners will be due to natural causes. Most natural deaths are due to cardiac-related disorders, malignancy, or infection. In rare cases, a definitive cause of death may not be identified following a complete and thorough autopsy. Although this is quite unsatisfying for the pathologist and the family, a "negative" autopsy can still prove to be vital. The lack of a definitive cause may prompt further investigations; rare hereditary diseases, hazardous environmental conditions, unusual toxic exposures, or unsafe consumer products may only be suspected or identified after a complete, detailed, and through autopsy rules out more likely causes.
 Even when a death is unequivocally due to a natural disease process, careful attention should be paid to an individual's risk factors for that particular disease. A number of common natural diseases can occur spontaneously or can be secondary to a nonnatural, injurious event. The inciting event may be recent, but it does not have to be; care should be taken when reviewing the decedent's history. Identification of a nonnatural proximate cause can significantly change the manner of death, as illustrated in the example provided below:
@@ -29,11 +25,6 @@ Despite comprehensive autopsy protocols, approximately 10-19% of sudden natural 
 Cardiovascular diseases are the leading cause of sudden natural deaths, particularly after the age of 40 years. Among young adults aged 18-35 years, ischemic heart disease particularly due to atherosclerotic coronary artery disease is the most common cause. Other significant causes include nonatherosclerotic coronary anomalies, aortic dissections, and cardiomyopathies. Infectious etiologies also contribute to sudden cardiac deaths.
 The meticulous investigation of sudden natural deaths through autopsy, supplemented by molecular diagnostics, when necessary, is essential for accurate cause-of-death determination, public health surveillance, and familial risk assessment. Ongoing efforts to standardize molecular autopsy protocols and address challenges in genetic variant interpretation are crucial for advancing the field of forensic pathology.
 See also Religions and the Autopsy .
-- ME jurisdiction: sudden/unexpected deaths, esp younger decedents; autopsy vs external exam case-dependent.
-- Review PMH + scene history pre-autopsy; history often critical for cause-of-death interpretation.
-- Cardiac, pulmonary, CNS causes dominate; age-specific etiologies vary, incl congenital/infectious in youth.
-- Negative autopsy ≠ no cause; molecular autopsy may reveal channelopathy/cardiomyopathy, 10-19% remain unexplained.
-- Avoid overcalling atherosclerosis; subtle trauma, poisoning, resuscitation artifacts, and patchy lesions need careful sampling.
 
 ## Terminology
 
@@ -412,30 +403,26 @@ In certain cases, it may be necessary to collect material for cytogenetic analys
 
 Many of the same biochemical tests that are performed on living individuals can also be performed postmortem; however, there is typically a lack of standardized reference values for postmortem samples, making interpretation of the results more difficult. Typically, reference ranges are calibrated based on blood, serum, or urine from living patients, and their applicability to postmortem samples may be limited. Another limiting factor is the postmortem stability of the analyte as well as the effects of hemoconcentration and postmortem redistribution.
 Various types of body fluids may be used for postmortem biochemical testing (blood, urine, CSF, joint fluid, VH); however, VH is typically the most useful for routine analyses. Compared with blood and other body fluids, VH is relatively more stable, well-protected from contamination or passive diffusion, and is easily collected.
-Reference values
+
+#### Reference values
+
 A panel of biochemical tests, essentially equivalent to a basic metabolic panel in living patients, is routinely performed on postmortem vitreous samples. The panel includes vitreous sodium, potassium, chloride, urea nitrogen, creatinine, and glucose. Reference ranges have been established for these tests and quantitative results and overall patterns can be of diagnostic significance (see Table 1).
+
 Table 1. Postmortem Vitreous Reference Ranges for Some Common Chemistries
-Analysis
-Reference Range
-Sodium (Na + )
-135-150 mmol/L
-Chloride (Cl - )
-105-135 mmol/L
-Potassium (K + )
-< 15 mmol/L
-Creatinine (Cr)
-0.6-1.3 mg/dL
-VUN
-8-20 mg/dL
-Glucose
-< 200 mg/dL
-Ketoacids
-Negative
-Alcohol
-Negative
+Analysis ---> Reference Range
+Sodium (Na + ) ---> 135-150 mmol/L
+Chloride (Cl - ) ---> 105-135 mmol/L
+Potassium (K + ) ---> < 15 mmol/L
+Creatinine (Cr) ---> 0.6-1.3 mg/dL
+VUN ---> 8-20 mg/dL
+Glucose ---> < 200 mg/dL
+Ketoacids ---> Negative
+Alcohol ---> Negative
 Source : Rose KL, Collins KA. Vitreous postmortem chemical analysis. NewsPath [serial online]. College of American Pathologists. December 1, 2008.
 VUN = urea nitrogen concentration in vitreous humor.
-Common patterns
+
+#### Common patterns
+
 Common patterns are as follows in selected conditions:
 - Hypertonic dehydration - ↑ Na + , ↑ Cl − , ↑ Cr, ↑↑ VUN (> 40 mg/dL)
 - Hypotonic dehydration - ↓ Na + , ↓ Cl − , +/− ↑ Cr, ↑ VUN
@@ -444,7 +431,8 @@ Common patterns are as follows in selected conditions:
 - Decomposition - ↓ Na + , ↓ Cl − , ↑ K + , positive alcohol
 - Vomiting - ↓ Cl −
 - Low salt, water intoxication - ↓ Na + , ↓ Cl − , ↓ K +
-Differential diagnosis
+
+#### Differential diagnosis
 The differential diagnosis of certain analytes is summarized below:
 Elevated glucose ↑↑ (> 200 mg/dL) occurs in the following conditions:
 - Diabetes
@@ -459,70 +447,3 @@ Positivity for alcohols can occur in the following situations:
 - Decomposition (↑ K)
 - Ethanol ingestion, acute ethanol toxicity (> 350 mg/dL)
 - Isopropanol
-See also Postmortem Vitreous Analyses .
-- Pathology of sudden natural death. Cardiomegaly (220 g) and symmetric left ventricular hypertrophy from the autopsy of a 6-year-old boy who suddenly collapsed while on a walk with his family. These findings are consistent with symmetric hypertrophic cardiomyopathy. Other autopsy findings included pulmonary edema and ascites, as well as hypertensive changes in the lungs and early cardiac cirrhosis.
-- Pathology of sudden natural death. This photograph demonstrates asymmetric anteroseptal myocardial hypertrophy in hypertrophic cardiomyopathy. The decedent was a healthy 17-year-old boy who collapsed shortly after finishing an obstacle course during Reserve Officers' Training Corps (ROTC) training.
-- Pathology of sudden natural death. This photomicrograph demonstrates hypertrophic cardiomyopathy.
-- Pathology of sudden natural death. This photomicrograph demonstrates fibrosis and myocardial disarray in hypertrophic cardiomyopathy.
-- Pathology of Sudden Natural Death. Isolated left ventricular myocardial noncompaction. The heart is enlarged (530 g) with biventricular dilatation and subendocardial trabeculation that is near transmural in areas. The decedent was a 32-year-old man found down on the side of the road.
-- Pathology of Sudden Natural Death. This photograph demonstrates extensive fatty replacement of the right ventricular wall in arrhythmogenic right ventricular dysplasia (ARVD). The decedent was a previously healthy 35-year-old woman who had a witnessed collapse while walking.
-- Pathology of Sudden Natural Death. Multifocal, lipomatous infiltration of the left ventricle with cardiomegaly (600 g) and left ventricular hypertrophy, consistent with arrhythmogenic left ventricular dysplasia (ALVD). The decedent, a 44-year-old woman with a history of asthma, had been swimming in a cold lake. She reportedly came out of the water complaining of "not feeling well." She used her albuterol inhaler; then, within a short time period, she became unresponsive and went into cardiac arrest.
-- Pathology of Sudden Natural Death. Nodular tan-white infiltrates are seen throughout the myocardium a case of systemic sarcoidosis. The decedent had complained of not feeling well several days before his death, but he had had no specific symptoms and had not sought medical attention. The presence of randomly distributed, scarlike nodules involving both ventricles and papillary muscles but which do not appear to be associated with a specific vascular territory or with coronary atherosclerosis favors a diagnosis of sarcoidosis over that of healed myocardial infarcts.
-- Pathology of Sudden Natural Death. Multiple, noncaseating granulomas within the myocardium and epicardial fat in systemic sarcoidosis.
-- Pathology of Sudden Natural Death. Multiple, noncaseating granulomas within the myocardium and epicardial fat in systemic sarcoidosis.
-- Pathology of Sudden Natural Death. High-power photomicrograph of a noncaseating granuloma in systemic sarcoidosis.
-- Pathology of Sudden Natural Death. Systemic sarcoidosis. Well-defined, noncaseating granulomas are seen within the lung parenchyma, which is otherwise normal.
-- Pathology of Sudden Natural Death. Cardiomegaly (80 g) with left ventricular fibrosis in a 9-month-old male infant who had been seen by his pediatrician the day before for an upper respiratory infection. He was taken to the emergency department the day of his death for difficulty breathing. While playing in the waiting room, he suddenly stiffened, arched his back, and went into cardiac arrest.
-- Pathology of Sudden Natural Death. Photomicrograph of the left ventricular wall showing a large, geographic area of fibrosis and inflammation in a case of active lymphohistiocytic myocarditis.
-- Pathology of Sudden Natural Death. Lymphohistiocytic myocarditis, trichrome stain.
-- Pathology of Sudden Natural Death. This photomicrograph shows dense, mixed inflammation of the myocardium in lymphohistiocytic myocarditis.
-- Pathology of Sudden Natural Death. Higher-power view of the previous image, showing dense, chronic inflammation with destruction of the myocytes.
-- Pathology of Sudden Natural Death. Congenital supracristal ventricular septal defect in a 21-year-old patient with Eisenmenger complex. The decedent was found dead in his bed by his stepfather.
-- Pathology of sudden natural death. The mitral valve leaflets are thickened and appear redundant in this case of moderate to severe mitral valve prolapse.
-- Pathology of Sudden Natural Death. Congenital bicuspid aortic valve.
-- Pathology of Sudden Natural Death. Hemopericardium in sudden death due to aortic dissection.
-- Pathology of Sudden Natural Death. This is an in situ photograph demonstrating a type A aortic dissection.
-- Pathology of Sudden Natural Death. This photograph illustrates a type A aortic dissection with concomitant dissection of the pulmonary artery.
-- Pathology of Sudden Natural Death. A magnified view of the type A aortic dissection with concomitant dissection of the pulmonary artery from the previous image.
-- Pathology of Sudden Natural Death. Arteriolonephrosclerosis in a case of long-standing hypertensive cardiovascular disease.
-- Pathology of sudden natural death. A 53-year-old female with a history of drug abuse was found dead in a "crack house." At autopsy, infarcts and microabscesses were seen in multiple organ systems, including the spleen, kidneys, and brain (including the leptomeninges). Examination of the heart revealed a destructive bacterial vegetation eroding through the mitral valve with extension into the aortic valve. There was evidence of rheumatic heart disease and extensive dental carries. Cultures from the leptomeninges grew alpha-hemolytic streptococci.
-- Pathology of Sudden Natural Death. This is a postmortem indirect ophthalmoscopic image showing 2 fundal hemorrhages (Roth spots) in a case of acute bacterial endocarditis.
-- Pathology of sudden natural death. Acute myocardial infarction.
-- Pathology of sudden natural death. Acute myocardial infarction with early granulation tissue and neovascularization.
-- Pathology of sudden natural death. Acute myocardial infarction with extensive coagulative necrosis.
-- Pathology of Sudden Natural Death. Coronary artery dissection seen in a case of sudden death in a young woman.
-- Pathology of Sudden Natural Death. Higher power view of the previous image showing the acute dissection of an epicardial artery with focal eosinophilic inflammation.
-- Pathology of sudden natural death. A 28-year-old male with no previous medical history was found dead in bed by his wife. At autopsy, the male had pectus carinatum and arachnodactyly. Internally, he had massive hemopericardium from rupture of a large aortic root aneurysm.
-- Pathology of Sudden Natural Death. Photomicrograph of an aortic root aneurysm in a patient with Marfan syndrome (same patient as in the previous image). There is obvious fragmentation of the media with myxoid degeneration.
-- Pathology of Sudden Natural Death. Photomicrograph of an aortic root aneurysm in a patient with Marfan syndrome (same patient as in the previous image). Fragmentation of the media is highlighted by the Verhoeff-Van Gieson (EVG) elastic stain.
-- Pathology of Sudden Natural Death. This in situ photograph shows significant cardiomegaly in a 5-month-old infant with endocardial fibroelastosis.
-- Pathology of Sudden Natural Death. A cross-section of the heart from the previous image in a 5-month-old with endocardial fibroelastosis. This photograph demonstrates thickening and fibrosis of the subendocardium.
-- Pathology of Sudden Natural Death. This photomicrograph shows fibrosis of the endocardium from the heart of a 5-month-old infant who died from endocardial fibroelastosis (same patient as in the previous image).
-- Pathology of Sudden Natural Death. Verhoeff-Van Gieson (EVG) elastic stain showing fibrosis and elastosis of the endocardium in endocardial fibroelastosis (same patient as in the previous image).
-- Pathology of Sudden Natural Death. This photograph depicts a bowel infarct.
-- Pathology of Sudden Natural Death. Hemorrhagic mucosa in a case of bowel infarct due to mesenteric ischemia.
-- Pathology of sudden natural death. Severe hemorrhagic pneumonia and suppurative pleuritis due to community-acquired methicillin-resistant Staphylococcus aureus (CA-MRSA), which produced the Panton-Valentine Leukocidin (PVL) toxin. This photograph is from the autopsy of a 3-year-old child who died suddenly 2-3 days after developing an upper respiratory tract infection. Other family members had been sick with similar symptoms, but all had recovered in a few days.
-- Pathology of Sudden Natural Death. Acute necrotizing pyelonephritis due to Klebsiella oxytoca and Escherichia coli. The decedent was a 31-year-old woman with a history of idiopathic thrombocytopenic purpura and previous splenectomy. She presented to the emergency department complaining of nausea, vomiting, and abdominal pain, where she underwent cardiac arrest.
-- Pathology of sudden natural death. Purulent meningitis in a 34-year-old male with acute bacterial pyarthrosis due to Streptococcus pneumoniae.
-- Pathology of sudden natural death. Occlusive pulmonary saddle embolus from the autopsy of a 69-year-old male who was found dead in his hotel room following a long car trip.
-- Pathology of Sudden Natural Death. This photomicrograph shows a section of kidney from a previously healthy, middle-aged man found dead at home.
-- Pathology of Sudden Natural Death. Polarization of the previous photomicrograph demonstrates the accumulation of polarizable material within the renal tubules, consistent with ethylene glycol poisoning. (Section of kidney from a previously healthy, middle-aged man found dead at home.)
-- Pathology of Sudden Natural Death. Atrophy of the cerebellar vermis in a patient with chronic alcoholism.
-- Sections Sudden Natural Death Pathology
-- Overview
-- Terminology
-- Medical Examiner Role and Autopsy Indications
-- Epidemiology
-- Etiology
-- Scene Findings and Trace Evidence Collection
-- Gross External and Internal Examinations
-- Special Dissections
-- Special Handling
-- Histology and Microscopic Examination
-- Photography and Documentation
-- Ancillary and Adjunctive Studies
-- Show All
-- Media Gallery
-- Tables
-- References
-This tool is intended for educational purposes only. Please consult official clinical guidelines for diagnosis or treatment. Medscape AI Disclaimer
