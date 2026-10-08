@@ -71,6 +71,8 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from transformers.models.siglip.modeling_siglip import (np, nn)
 
 def forward(self, input: Tensor) -> Tensor:
+    original_dtype = input.dtype
+    if self.weight is not None: input = input.to(self.weight.dtype)
     self._check_input_dim(input)
 
     # exponential_average_factor is set to self.momentum
@@ -118,4 +120,4 @@ def forward(self, input: Tensor) -> Tensor:
         bn_training,
         exponential_average_factor,
         self.eps,
-    ).to(input.dtype)
+    ).to(original_dtype)

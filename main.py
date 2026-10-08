@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 
 import gradio as gr
+import httpx
 from dotenv import load_dotenv
 
 logging.basicConfig(
@@ -113,6 +114,34 @@ def _process_alive(proc: subprocess.Popen | None) -> bool:
 SERVER_READY_TIMEOUT = float(os.getenv("SERVER_READY_TIMEOUT_SECONDS", "300"))
 
 
+def _watch_server_exits(procs: dict, logdir) -> None:
+    import signal as _signal
+    import threading
+
+    def _loop():
+        reported = set()
+        while len(reported) < len(procs):
+            for name, proc in procs.items():
+                if proc is None or name in reported:
+                    continue
+                rc = proc.poll()
+                if rc is None:
+                    continue
+                reported.add(name)
+                try:
+                    sig = _signal.Signals(-rc).name if rc < 0 else ""
+                except ValueError:
+                    sig = ""
+                msg = (f"[server-watch] {name} exited: returncode={rc} {sig} "
+                       f"at {time.strftime('%H:%M:%S')} (expected if you pressed Stop)")
+                print(msg, flush=True)
+                with open(Path(logdir) / "exit_codes.log", "a") as f:
+                    f.write(msg + "\n")
+            time.sleep(1)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def launch_servers():
     """
     Start the MCP tools server, the Profiler A2A server, and the
@@ -180,7 +209,8 @@ def launch_servers():
     # in "w") guarantees each log file contains only the run that's
     # about to start.
     for logfile in (mcp_logfile, profiler_logfile, forensic_logfile):
-        logfile.unlink(missing_ok=True)
+        if logfile.exists():
+            os.replace(logfile, logfile.with_name(logfile.name + '.prev'))
 
     mcp_log = open(mcp_logfile, "w")
     profiler_log = open(profiler_logfile, "w")
@@ -204,6 +234,10 @@ def launch_servers():
         )
     except Exception as e:
         return f"❌ Server launch failed: {e}"
+
+    _watch_server_exits(
+        {"MCP": mcp_proc, "Profiler": profiler_proc, "Forensic": forensic_proc}, log_dir
+    )
 
     ready = _wait_for_ports(
         {"MCP": MCP_PORT, "Profiler": PROFILER_PORT, "Forensic": FORENSIC_PORT},
@@ -489,7 +523,7 @@ async def step_forensic_stream(image_urls: list[str], prompt: str):
         ):
             text += delta
             yield text
-    except RuntimeError as e:
+    except (RuntimeError, httpx.HTTPError) as e:
         elapsed = time.monotonic() - start
         log.info(f"[1/4] Forensic agent stream FAILED after {elapsed:.1f}s: {e}")
         raise RuntimeError(f"Forensic agent failed: {e}") from e
@@ -636,7 +670,7 @@ async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_
         ):
             text += delta
             yield text
-    except RuntimeError as e:
+    except (RuntimeError, httpx.HTTPError) as e:
         elapsed = time.monotonic() - start
         log.info(f"[3/4] Profiler agent stream FAILED after {elapsed:.1f}s: {e}")
         raise RuntimeError(f"Profiler agent failed: {e}") from e

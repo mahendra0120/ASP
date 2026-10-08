@@ -21,7 +21,6 @@ actually executes the tool and loops generation with the result.
 """
 
 from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -31,12 +30,9 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-
 from dotenv import load_dotenv
 from huggingface_hub import snapshot_download
 from transformers import AutoProcessor
-from unsloth import FastVisionModel
-
 from pydantic_ai.messages import (
     BinaryContent,
     DocumentUrl,
@@ -76,51 +72,80 @@ def _download(repo_id: str) -> str:
     return snapshot_download(repo_id=repo_id, token=os.getenv("HF_TOKEN"))
 
 
-def _load_with_unsloth(local_path: str, processor_path: Optional[str], load_in_4bit: bool):
+def _load_with_transformers(local_path: str, processor_path: Optional[str], load_in_4bit: bool):
     """
-    Load via unsloth's FastVisionModel.
+    Load with plain transformers (no unsloth): bf16 on the GPU, SDPA attention.
+    Adapter repos (adapter_config.json) are loaded onto their base model and merged.
+    Set ADAPTER_BASE_MODEL_ID to override the base; ATTN_IMPLEMENTATION=eager to rule out attention kernels.
+    """
+    import torch
+    from transformers import AutoModelForImageTextToText
 
-    Known gotcha: for some model repos (custom fine-tunes especially —
-    e.g. Kizzington/Qwen3-VL-8B-Thinking-heretic), unsloth's internal
-    processor auto-detection can fail to match `model_type` to a known
-    processor class and silently return `processor=None` instead of
-    raising — you'll see
-        "Unsloth: Warning - VLM processor fallback returned None for
-        model_type=..."
-    in the logs right when this happens. If we don't catch that here,
-    the None processor gets returned as if everything were fine, and
-    the actual crash happens much later and far away from the cause —
-    typically an opaque `AttributeError: 'NoneType' object has no
-    attribute 'apply_chat_template'` (or similar) deep in a generation
-    call, which looks nothing like a processor-loading problem. So:
-    explicitly recover with a plain `AutoProcessor.from_pretrained`
-    call when unsloth hands back None, and raise a clear, specific
-    error immediately if even that fails — right here, not three
-    layers of call stack later.
-    """
-    model, processor = FastVisionModel.from_pretrained(
-        local_path,
-        load_in_4bit=load_in_4bit,
+    kwargs = dict(
+        dtype=torch.bfloat16,
+        device_map="cuda" if torch.cuda.is_available() else None,
+        attn_implementation=os.getenv("ATTN_IMPLEMENTATION", "sdpa"),
     )
-    FastVisionModel.for_inference(model)  # enable unsloth's fast inference path
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
 
-    if processor_path:
-        processor = AutoProcessor.from_pretrained(processor_path)
-    elif processor is None:
-        try:
-            processor = AutoProcessor.from_pretrained(local_path)
-        except Exception as e:
+    root = Path(local_path)
+    adapter_cfg_file = root / "adapter_config.json"
+    base_path = None
+    if adapter_cfg_file.exists():
+        base_id = os.getenv("ADAPTER_BASE_MODEL_ID") or json.loads(
+            adapter_cfg_file.read_text()
+        ).get("base_model_name_or_path")
+        if not base_id:
             raise RuntimeError(
-                f"Model loaded successfully, but no processor could be "
-                f"obtained for {local_path!r}: unsloth's own processor "
-                f"auto-detection returned None (see the 'VLM processor "
-                f"fallback returned None' warning above this error), and "
-                f"the AutoProcessor.from_pretrained fallback also failed "
-                f"with: {e!r}. Pass an explicit `processor_path` to "
-                f"make_model() pointing at a repo/path with a compatible "
-                f"processor config for this model."
-            ) from e
+                f"{local_path!r} is an adapter repo but adapter_config.json names no "
+                f"base model; set ADAPTER_BASE_MODEL_ID."
+            )
+        if "bnb-4bit" in base_id and not load_in_4bit:
+            log.warning(
+                f"adapter base {base_id!r} is a pre-quantized bnb-4bit repo; if loading "
+                f"or merging fails, set ADAPTER_BASE_MODEL_ID to a full-precision base."
+            )
+        base_path = base_id if Path(base_id).exists() else _download(base_id)
+        log.info(f"Adapter repo detected; loading base {base_id!r} then applying {local_path!r}")
+        model = AutoModelForImageTextToText.from_pretrained(base_path, **kwargs)
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, local_path)
+        if not load_in_4bit:
+            try:
+                model = model.merge_and_unload()
+            except Exception as e:
+                log.warning(f"Could not merge adapter ({e!r}); running with the adapter attached.")
+    else:
+        model = AutoModelForImageTextToText.from_pretrained(local_path, **kwargs)
+    model.eval()
 
+    def _is_real_vlm_processor(proc) -> bool:
+        return proc is not None and hasattr(proc, "image_processor")
+
+    candidates = [processor_path] if processor_path else [local_path] + ([base_path] if base_path else [])
+    processor = None
+    errors = []
+    for src in candidates:
+        try:
+            proc = AutoProcessor.from_pretrained(src)
+        except Exception as e:
+            errors.append(f"{src}: {e!r}")
+            continue
+        if _is_real_vlm_processor(proc):
+            processor = proc
+            break
+        errors.append(f"{src}: loaded {type(proc).__name__} without an image_processor")
+    if processor is None:
+        raise RuntimeError(
+            f"Model loaded, but no usable image processor was found. Tried: {errors}. "
+            f"Pass processor_path (e.g. 'Qwen/Qwen3-VL-8B-Thinking') to make_model()."
+        )
     return model, processor
 
 
@@ -134,7 +159,7 @@ def _load(model_id: str, adapter_path: Optional[str], processor_path: Optional[s
     reusing whichever was loaded first.
     """
     local_path = _download(model_id)
-    model, processor = _load_with_unsloth(local_path, processor_path, load_in_4bit)
+    model, processor = _load_with_transformers(local_path, processor_path, load_in_4bit)
 
     if adapter_path:
         model.load_adapter(adapter_path)

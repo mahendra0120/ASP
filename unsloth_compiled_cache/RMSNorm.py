@@ -71,7 +71,9 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from transformers.models.siglip.modeling_siglip import (torch)
 
 def forward(self, x: torch.Tensor) -> torch.Tensor:
+    original_dtype = x.dtype
+    if self.weight is not None: x = x.to(self.weight.dtype)
     """
     Runs the forward pass.
     """
-    return F.rms_norm(x, self.normalized_shape, self.weight, self.eps).to(x.dtype)
+    return F.rms_norm(x, self.normalized_shape, self.weight, self.eps).to(original_dtype)

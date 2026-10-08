@@ -94,7 +94,10 @@ skills_client = FastMCPClient(
     ),
     init_timeout=60,
 )
-skills_toolset = MCPToolset(skills_client)
+_ALLOWED_SKILL_TOOLS = {"read_file", "list_directory"}
+skills_toolset = MCPToolset(skills_client).filtered(
+    lambda ctx, tool_def: tool_def.name in _ALLOWED_SKILL_TOOLS
+)
 
 
 def _load_skill_text(path: Path) -> str:
@@ -132,6 +135,7 @@ _OUTPUT_MD = _load_skill_text(CBA_SKILL_DIR / "references" / "OUTPUT.md")
 profile_agent: Agent[None, str] = Agent(
     model=make_model(
         PROFILER_MODEL_ID,
+        processor_path="Qwen/Qwen3-VL-8B-Thinking",
         reference_images=SHORT_REFERENCE_IMAGES,
         temperature=0.3,
         # This agent's system prompt embeds the full skill file +
@@ -176,6 +180,12 @@ profile_agent: Agent[None, str] = Agent(
         "always have it regardless of whether you call any tool — you may "
         "still optionally use read_file to go deeper into references/ or "
         "assets/long/ as it describes below.\n\n"
+        f"TOOL RULES: your only tools are read_file and list_directory, and they can ONLY "
+        f"read inside {SKILLS_DIR}. Use absolute paths under that folder, for example "
+        f"{CBA_SKILL_DIR}/references/REFERENCE.md. The case images are ALREADY attached "
+        "to this message: never try to open, locate or re-read them with a tool, and "
+        "never invent file paths such as /data/.... If a tool returns an error, do NOT "
+        "repeat the same call; continue with what you already have.\n\n"
         f"{_SKILL_MD}\n\n"
         "--- Your required output format (references/OUTPUT.md), verbatim ---\n"
         "You MUST use exactly these Markdown sections, in this order:\n\n"
@@ -191,5 +201,5 @@ profile_agent: Agent[None, str] = Agent(
         "filling the gap with an invented specific."
     ),
     toolsets=[skills_toolset],
-    retries=2,
+    retries=4,
 )

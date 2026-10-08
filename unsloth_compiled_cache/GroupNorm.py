@@ -71,4 +71,6 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from transformers.models.siglip.modeling_siglip import (np)
 
 def forward(self, input: Tensor) -> Tensor:
-    return F.group_norm(input, self.num_groups, self.weight, self.bias, self.eps).to(input.dtype)
+    original_dtype = input.dtype
+    if self.weight is not None: input = input.to(self.weight.dtype)
+    return F.group_norm(input, self.num_groups, self.weight, self.bias, self.eps).to(original_dtype)
