@@ -47,4 +47,5 @@ dependencies = [
     "transformers>=5.1.0,<=5.5.0",
     "unsloth>=2026.9.1",
     "uvicorn>=0.46.0",
+    "gh>=0.0.4",
 ]
