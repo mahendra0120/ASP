@@ -1,7 +1,6 @@
 """
 main_gradio.py - Enhanced with Image Upload + Extra Context
 """
-import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE / ports; must run before huggingface_hub is imported)
 
 import os
 import asyncio
@@ -19,7 +18,6 @@ import shutil
 
 import gradio as gr
 import pipeline_state as pstate
-import example_images
 import httpx
 from dotenv import load_dotenv
 
@@ -673,30 +671,6 @@ async def delete_all_cases_ui(confirm):
     return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
 
 
-def refresh_examples():
-    """Thumbnails of photos uploaded before (temp_uploads/), newest first, duplicates removed.
-    Set SHOW_UPLOAD_EXAMPLES=0 to hide them (they are real case photos)."""
-    if os.getenv("SHOW_UPLOAD_EXAMPLES", "1") == "0":
-        return [], []
-    items = example_images.list_example_images(TEMP_IMAGE_DIR, limit=24)
-    return [(it["path"], it["name"]) for it in items], [it["path"] for it in items]
-
-
-def add_example(current_files, example_list, evt: gr.SelectData):
-    """Clicking a thumbnail adds that photo to the upload box (never twice, never beyond MAX_IMAGES)."""
-    files = example_images.normalize_paths(current_files)
-    try:
-        chosen = (example_list or [])[int(evt.index)]
-    except (TypeError, ValueError, IndexError):
-        return files or None
-    return example_images.add_unique(files, [chosen], MAX_IMAGES, warn=gr.Warning) or None
-
-
-def add_all_examples(current_files, example_list):
-    files = example_images.normalize_paths(current_files)
-    return example_images.add_unique(files, list(example_list or []), MAX_IMAGES, warn=gr.Warning) or None
-
-
 async def list_cases_for_ui():
     rows = await pstate.list_cases_safe()
     return gr.Dropdown(choices=[(pstate.describe_case(r), r["case_id"]) for r in rows], value=None)
@@ -915,20 +889,6 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
                 lines=3
             )
 
-            with gr.Accordion("🖼 Examples - photos you uploaded before", open=True):
-                gr.Markdown(
-                    "Click a thumbnail to add it to **Upload Photos** above. The same photo is never added twice. "
-                    "Pick the same photos in the same order as before to find that case's saved progress."
-                )
-                example_gallery = gr.Gallery(
-                    show_label=False, columns=6, height=220, object_fit="cover",
-                    allow_preview=False, interactive=False,
-                )
-                example_paths = gr.State([])
-                with gr.Row():
-                    add_all_btn = gr.Button("➕ Add all shown (up to 15)")
-                    refresh_examples_btn = gr.Button("🔄 Refresh examples")
-
     run_btn = gr.Button("▶ Run Pipeline", variant="primary", size="large")
 
     with gr.Row():
@@ -983,15 +943,9 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
         fn=run_pipeline,
         inputs=[image_input, url_input, extra_context, resume_mode, saved_case],
         outputs=[forensic_out, profiler_out, rag_out, full_out, status_out],
-    ).then(fn=list_cases_for_ui, outputs=saved_case).then(
-        fn=refresh_examples, outputs=[example_gallery, example_paths]
-    )
+    ).then(fn=list_cases_for_ui, outputs=saved_case)
     refresh_cases.click(fn=list_cases_for_ui, outputs=saved_case)
     demo.load(fn=list_cases_for_ui, outputs=saved_case)
-    demo.load(fn=refresh_examples, outputs=[example_gallery, example_paths])
-    refresh_examples_btn.click(fn=refresh_examples, outputs=[example_gallery, example_paths])
-    example_gallery.select(fn=add_example, inputs=[image_input, example_paths], outputs=image_input)
-    add_all_btn.click(fn=add_all_examples, inputs=[image_input, example_paths], outputs=image_input)
     delete_case_btn.click(fn=delete_selected_case_ui, inputs=[delete_confirm, saved_case],
                           outputs=[memory_status, saved_case, delete_confirm])
     delete_old_btn.click(fn=delete_old_cases_ui, inputs=[delete_confirm, older_days],

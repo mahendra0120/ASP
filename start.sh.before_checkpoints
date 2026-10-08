@@ -23,8 +23,5 @@ bash ./setup_postgres.sh
 echo ">> Syncing Python dependencies..."
 uv sync --frozen
 
-echo ">> Effective runtime settings (what the Python programs will use):"
-uv run python env_defaults.py || true
-
 echo ">> Starting ASP (Gradio on 0.0.0.0:7860)..."
 exec uv run python main.py

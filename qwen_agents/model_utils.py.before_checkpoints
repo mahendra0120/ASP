@@ -21,10 +21,6 @@ actually executes the tool and loops generation with the result.
 """
 
 from __future__ import annotations
-try:  # apply the runtime defaults even if the caller did not
-    import env_defaults  # noqa: F401
-except ImportError:
-    pass
 import asyncio
 import json
 import logging
@@ -56,8 +52,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 log = logging.getLogger("model_utils")
 
-hf_home = os.getenv("HF_HOME") or "/workspace/hf_cache"
-os.environ["HF_HOME"] = hf_home
+hf_home = os.getenv("HF_HOME")
+if not hf_home:
+    raise RuntimeError("HF_HOME is not set")
 
 log.info(f"Using HF_HOME: {hf_home}")
 

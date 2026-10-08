@@ -29,7 +29,6 @@ in place for anyone who deliberately wants both agents in a single
 process — e.g. a single-GPU box where the OS-level process split
 doesn't help because it's the same physical VRAM pool either way.
 """
-import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE / ports; must run before huggingface_hub is imported)
 
 import asyncio
 import logging

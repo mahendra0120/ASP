@@ -1,7 +1,6 @@
 """
 main_gradio.py - Enhanced with Image Upload + Extra Context
 """
-import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE / ports; must run before huggingface_hub is imported)
 
 import os
 import asyncio
@@ -18,8 +17,6 @@ from pathlib import Path
 import shutil
 
 import gradio as gr
-import pipeline_state as pstate
-import example_images
 import httpx
 from dotenv import load_dotenv
 
@@ -316,172 +313,67 @@ def save_uploaded_images(images) -> list[str]:
 # Pipeline
 # =============================================
 
-def _start_single_agent(name: str) -> str:
-    """Start ONLY the named agent server (crash recovery). launch_servers() would
-    relaunch all three and orphan the ones that are still healthy."""
-    global profiler_proc, forensic_proc
-    script, port, logname = {
-        "Forensic": ("A2A_forensic_server.py", FORENSIC_PORT, "forensic_server.log"),
-        "Profiler": ("A2A_profiler_server.py", PROFILER_PORT, "profiler_server.log"),
-    }[name]
-    path = REPO_ROOT / script
-    if not path.exists():
-        return f"❌ {name}: missing {script}"
-    log_dir = REPO_ROOT / "server_logs"
-    log_dir.mkdir(exist_ok=True)
-    logfile = log_dir / logname
-    if logfile.exists():                      # keep the dead server's log (it holds the crash trace)
-        os.replace(logfile, logfile.with_name(logfile.name + ".prev"))
-    proc = subprocess.Popen(
-        [sys.executable, str(path)],
-        stdout=open(logfile, "w"), stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
-    )
-    if name == "Forensic":
-        forensic_proc = proc
-    else:
-        profiler_proc = proc
-    if "_watch_server_exits" in globals():
-        _watch_server_exits({name: proc}, log_dir)
-    ready = _wait_for_ports({name: port}, timeout=SERVER_READY_TIMEOUT)
-    return f"✅ {name}:{port} restarted" if ready.get(name) else f"⚠️ {name}:{port} did not come up (see {logfile})"
-
-
-async def _ensure_agent_up(name: str) -> None:
-    port = FORENSIC_PORT if name == "Forensic" else PROFILER_PORT
-    if _port_open(port):
-        return
-    log.warning(f"{name} agent server is not listening on :{port} - restarting just that server")
-    log.info(await asyncio.to_thread(_start_single_agent, name))
-
-
-async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id: str, resume_mode: str = "continue"):
-    """
-    Forensic -> (RAG || Profiler) with every step checkpointed to Postgres
-    (see pipeline_state.py). resume_mode:
-      "continue" - reuse finished steps, continue partial reports where they stopped
-      "asis"     - reuse finished steps, accept partial reports as they are
-      "fresh"    - discard saved progress for this case and start over
-    """
+async def run_pipeline_async(image_urls: list[str], extra_context: str):
     forensic_text = ""
     profiler_text = ""
     rag_text = ""
     final_text = ""
-    store = pstate.CaseStore(case_id)
-
-    def S(msg: str) -> str:
-        return msg + store.status_suffix()
 
     try:
-        task_id = case_id
+        task_id = str(uuid.uuid4())[:8]
 
         forensic_message = FORENSIC_USER_MESSAGE
         if extra_context and extra_context.strip():
             forensic_message += f"\n\nAdditional Context:\n{extra_context}"
 
-        saved: dict = {}
-        if resume_mode == "fresh":
-            await store.delete_all()
-        else:
-            saved = await store.load_all()
-        await store.save("meta", pstate.meta_json(image_urls, extra_context), "complete")
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
 
-        summary = ", ".join(f"{k}={v['status']}" for k, v in saved.items() if k != "meta")
-        if summary:
-            log.info(f"[case {case_id}] resuming with saved progress: {summary} (mode={resume_mode})")
-        yield forensic_text, profiler_text, rag_text, final_text, S(
-            f"♻️ Case {case_id}: found saved progress ({summary}) - resuming..." if summary
-            else f"⏳ Case {case_id}: starting..."
-        )
-
-        # 1) Forensic. Finished -> reused; partial -> continued (or accepted as-is);
-        #    otherwise generated. Streams the agent's real output, checkpointed as it goes.
-        sf = saved.get("forensic")
-        forensic_done = False
-        prefix = ""
-        if sf and sf["status"] == "complete":
-            forensic_text, forensic_done = sf["content"], True
-            yield forensic_text, profiler_text, rag_text, final_text, S(
-                "♻️ Forensic report restored from the database - skipping that step"
-            )
-        elif sf and sf["status"] == "partial":
-            if resume_mode == "asis":
-                forensic_text, forensic_done = sf["content"], True
-                await store.save("forensic", forensic_text, "complete")
-                await store.invalidate(["rag", "profiler", "final"])
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "⏭ Using the saved partial Forensic report as-is"
-                )
-            else:
-                prefix = pstate.trim_partial(sf["content"])
-                forensic_text = prefix
-        forensic_reused = bool(sf and sf["status"] == "complete")
-
-        if not forensic_done:
-            # Anything computed from an older Forensic result is now stale.
-            await store.invalidate(["rag", "profiler", "final"])
-            if not _port_open(FORENSIC_PORT):
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "🔧 Forensic server is down - restarting it (the model reloads on first use)..."
-                )
-                await _ensure_agent_up("Forensic")
-            prompt = forensic_message
-            if prefix:
-                prompt += pstate.continuation_block("forensic report", prefix)
-            running = "⏳ Continuing the interrupted Forensic report..." if prefix else "⏳ Running Forensic agent..."
-            yield forensic_text, profiler_text, rag_text, final_text, S(running)
-            async for forensic_text in pstate.checkpointed(
-                step_forensic_stream(image_urls, prompt), store, "forensic", prefix=prefix
-            ):
-                yield forensic_text, profiler_text, rag_text, final_text, S(running)
+        # 1) The case image(s) go straight to the Forensic agent over A2A.
+        #    It has no MCP/skill access — it just analyzes what's in front
+        #    of it. This is GENUINE streaming: each `forensic_text` below
+        #    is the real, growing output of the remote model's generation
+        #    (via fasta2a==2.0.1's `message/stream` SSE endpoint), not a
+        #    replay of an already-finished string. Thinking tokens never
+        #    reach here at all — stripped before the model layer ever
+        #    yields a delta (model_utils.py's `_stream_run`) and,
+        #    redundantly, fasta2a's bridge only ever forwards TextPart
+        #    deltas in the first place.
+        #
+        #    This step has to happen alone, first: both of the next two
+        #    steps need its finished text as input.
+        async for forensic_text in step_forensic_stream(image_urls, forensic_message):
+            yield forensic_text, profiler_text, rag_text, final_text, "⏳ Running Forensic agent..."
         forensic_data = forensic_text
-        yield forensic_text, profiler_text, rag_text, final_text, S(
-            "⏳ Forensic agent complete - running Profiler agent and RAG grounding concurrently..."
+        yield forensic_text, profiler_text, rag_text, final_text, (
+            "⏳ Forensic agent complete — running Profiler agent and RAG grounding concurrently..."
         )
 
-        # 2) RAG and the Profiler run AT THE SAME TIME off the finished Forensic report.
-        #    Saved RAG/Profiler results are only reused if the Forensic report they were
-        #    built from was itself reused unchanged.
-        saved_rag = saved.get("rag") if forensic_reused else None
-        sp = saved.get("profiler") if forensic_reused else None
+        # 2) RAG and the Profiler agent now run AT THE SAME TIME, both
+        #    driven off the just-finished Forensic report:
+        #      - RAG (a FAISS/embedding similarity search over
+        #        forensic_knowledge/, CPU-bound, no model generation) reads
+        #        the Forensic report's own "## Evidence of Trauma" section
+        #        to decide whether to fire, then fetches grounding passages.
+        #      - The Profiler agent (GPU-bound generation, the slow part)
+        #        receives the Forensic report + case images and starts
+        #        generating immediately — it does NOT wait for RAG this
+        #        time, since RAG is normally so much faster than a full
+        #        model generation that it finishes well before the
+        #        Profiler does anyway. If the Profiler's report happens to
+        #        need the RAG passages verbatim quoted, this is the
+        #        trade-off: it no longer blocks on them first. If you'd
+        #        rather have the Profiler wait and receive RAG grounding
+        #        merged into its own prompt, that's the previous
+        #        strictly-sequential design and is easy to restore — just
+        #        say so.
+        #    RAG is wrapped as a single-item async generator so it can be
+        #    fanned in alongside the Profiler's real multi-chunk stream —
+        #    whichever finishes a step first updates its own panel
+        #    immediately rather than waiting on the other.
+        rag_task_gen = _one_shot_stream(step_forensic_rag(task_id, forensic_data))
+        profiler_gen = step_profiler_stream(image_urls, forensic_data)
 
-        async def _rag_step():
-            if saved_rag and saved_rag["status"] == "complete":
-                try:
-                    return pstate.loads(saved_rag["content"])
-                except ValueError:
-                    pass
-            data = await step_forensic_rag(task_id, forensic_data)
-            await store.save("rag", pstate.dumps(data), "complete")
-            return data
-
-        async def _saved_text(t: str):
-            yield t
-
-        profiler_source = None
-        p_prefix = ""
-        if sp and sp["status"] == "complete":
-            profiler_source = _saved_text(sp["content"])
-        elif sp and sp["status"] == "partial":
-            if resume_mode == "asis":
-                await store.save("profiler", sp["content"], "complete")
-                profiler_source = _saved_text(sp["content"])
-            else:
-                p_prefix = pstate.trim_partial(sp["content"])
-                profiler_text = p_prefix
-        if profiler_source is None:
-            if not _port_open(PROFILER_PORT):
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "🔧 Profiler server is down - restarting it (the model reloads on first use)..."
-                )
-                await _ensure_agent_up("Profiler")
-            cont = pstate.continuation_block("behavioral profile", p_prefix) if p_prefix else None
-            profiler_source = pstate.checkpointed(
-                step_profiler_stream(image_urls, forensic_data, None, continuation=cont),
-                store, "profiler", prefix=p_prefix,
-            )
-
-        rag_task_gen = _one_shot_stream(_rag_step())
-        async with aclosing(_run_concurrently({"rag": rag_task_gen, "profiler": profiler_source})) as stream:
+        async with aclosing(_run_concurrently({"rag": rag_task_gen, "profiler": profiler_gen})) as stream:
             async for latest, errors in stream:
                 if errors:
                     raise RuntimeError(
@@ -491,15 +383,15 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                     rag_data = latest["rag"]
                     rag_text = (
                         format_rag_section(rag_data) if rag_data["triggered"]
-                        else "_No evidence-of-trauma language detected in the Forensic report - RAG pipeline not triggered._"
+                        else "_No evidence-of-trauma language detected in the Forensic report — RAG pipeline not triggered._"
                     )
                 if latest["profiler"] != "":
                     profiler_text = latest["profiler"]
-                yield forensic_text, profiler_text, rag_text, final_text, S(
+                yield forensic_text, profiler_text, rag_text, final_text, (
                     "⏳ Running Profiler agent and RAG grounding concurrently..."
                 )
         profiler_data = profiler_text
-        yield forensic_text, profiler_text, rag_text, final_text, S("⏳ Finalizing report...")
+        yield forensic_text, profiler_text, rag_text, final_text, "⏳ Finalizing report..."
 
         log.info(f"Combining Forensic + RAG + Profiler results into final profiling report (task_id={task_id})")
         sections = [
@@ -512,19 +404,11 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
         final_markdown = "\n\n".join(sections) + "\n"
 
         Path("pipeline_result.md").write_text(final_markdown)
-        await store.save("final", final_markdown, "complete")
 
-        yield forensic_text, profiler_text, rag_text, final_markdown, S("✅ Pipeline completed successfully!")
+        yield forensic_text, profiler_text, rag_text, final_markdown, "✅ Pipeline completed successfully!"
     except Exception as e:
-        # Keep every panel's text (the old code overwrote ALL panels with the error,
-        # wiping a finished Forensic report). Progress is already in Postgres.
-        await asyncio.sleep(0.3)   # cancelled tasks (e.g. a Profiler stopped by a RAG error) finish flushing their partial output
-        hint = (
-            f" - progress is saved as case {case_id}; press ▶ Run Pipeline again "
-            f"(resume mode) to continue from where it stopped."
-            if store.ok else " - the database is unavailable, so this progress was NOT saved."
-        )
-        yield forensic_text, profiler_text, rag_text, final_text, f"❌ {e}{hint}"
+        error = f"❌ {str(e)}"
+        yield error, error, error, error, error
 
 
 async def _one_shot_stream(coro):
@@ -586,120 +470,35 @@ async def _run_concurrently(gens: dict):
                 t.cancel()
 
 
-async def run_pipeline(images, image_url, extra_context, resume_mode="continue", saved_case=None):
+async def run_pipeline(images, image_url, extra_context):
+    # Prioritize uploaded images over URL; combine if both given.
     image_urls: list[str] = []
 
-    if saved_case:
-        # Resume a saved case without re-uploading: images + context come from the database.
-        meta = await pstate.CaseStore(saved_case).load_meta()
-        if not meta or not meta.get("image_urls"):
-            yield tuple([f"❌ Saved case {saved_case} was not found in the database."] * 5)
+    if images:
+        if len(images) > MAX_IMAGES:
+            yield tuple([f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5)
             return
-        image_urls = list(meta["image_urls"])
-        extra_context = meta.get("extra_context", "")
-        missing = [u for u in image_urls if not pstate.image_available(u)]
-        if missing:
-            yield tuple([
-                f"❌ Saved case {saved_case}: {len(missing)} image file(s) no longer exist on disk. "
-                f"Re-upload the original images with the same context and run again - the case id "
-                f"will match and your saved progress will be used."
-            ] * 5)
-            return
-        case_id = saved_case
-    else:
-        # Prioritize uploaded images over URL; combine if both given.
-        if images:
-            if len(images) > MAX_IMAGES:
-                yield tuple([f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5)
-                return
-            image_urls.extend(save_uploaded_images(images))
+        image_urls.extend(save_uploaded_images(images))
 
-        if image_url and image_url.strip():
-            image_urls.append(image_url.strip())
+    if image_url and image_url.strip():
+        image_urls.append(image_url.strip())
 
-        if not image_urls:
-            yield tuple(["❌ Please provide at least one image upload or image URL"] * 5)
-            return
+    if not image_urls:
+        yield tuple(["❌ Please provide at least one image upload or image URL"] * 5)
+        return
 
-        if len(image_urls) > MAX_IMAGES:
-            yield tuple([f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 5)
-            return
-        case_id = pstate.case_id_for(image_urls, extra_context)
+    if len(image_urls) > MAX_IMAGES:
+        yield tuple([f"❌ Too many images ({len(image_urls)}). Max is {MAX_IMAGES}."] * 5)
+        return
 
-    log.info(f"Pipeline starting with {len(image_urls)} image(s) (case {case_id}, mode={resume_mode})")
+    log.info(f"Pipeline starting with {len(image_urls)} image(s)")
 
     try:
-        async for update in run_pipeline_async(image_urls, extra_context, case_id, resume_mode or "continue"):
+        async for update in run_pipeline_async(image_urls, extra_context):
             yield update
     except Exception as e:
         error = f"❌ Critical error: {e}"
         yield tuple([error] * 5)
-
-
-async def delete_selected_case_ui(confirm, case_id):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    if not case_id:
-        return "⚠️ Pick a saved case in the dropdown above first.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.forget_case(str(case_id)))
-    msg = (f"🗑 Deleted case {case_id} ({res} saved step(s))." if res else f"Nothing was saved under case {case_id}.") if ok \
-        else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-async def delete_old_cases_ui(confirm, days):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    try:
-        days = int(days)
-        if days < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        return "⚠️ Enter a whole number of days (1 or more).", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.delete_cases_older_than(days))
-    msg = f"🧹 Deleted {res} case(s) with no activity in the last {days} day(s)." if ok \
-        else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-async def delete_all_cases_ui(confirm):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.delete_all_cases())
-    msg = f"🗑 Deleted all {res} saved case(s)." if ok else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-def refresh_examples():
-    """Thumbnails of photos uploaded before (temp_uploads/), newest first, duplicates removed.
-    Set SHOW_UPLOAD_EXAMPLES=0 to hide them (they are real case photos)."""
-    if os.getenv("SHOW_UPLOAD_EXAMPLES", "1") == "0":
-        return [], []
-    items = example_images.list_example_images(TEMP_IMAGE_DIR, limit=24)
-    return [(it["path"], it["name"]) for it in items], [it["path"] for it in items]
-
-
-def add_example(current_files, example_list, evt: gr.SelectData):
-    """Clicking a thumbnail adds that photo to the upload box (never twice, never beyond MAX_IMAGES)."""
-    files = example_images.normalize_paths(current_files)
-    try:
-        chosen = (example_list or [])[int(evt.index)]
-    except (TypeError, ValueError, IndexError):
-        return files or None
-    return example_images.add_unique(files, [chosen], MAX_IMAGES, warn=gr.Warning) or None
-
-
-def add_all_examples(current_files, example_list):
-    files = example_images.normalize_paths(current_files)
-    return example_images.add_unique(files, list(example_list or []), MAX_IMAGES, warn=gr.Warning) or None
-
-
-async def list_cases_for_ui():
-    rows = await pstate.list_cases_safe()
-    return gr.Dropdown(choices=[(pstate.describe_case(r), r["case_id"]) for r in rows], value=None)
 
 
 async def step_forensic_stream(image_urls: list[str], prompt: str):
@@ -840,7 +639,7 @@ def format_rag_section(rag_data: dict) -> str:
     return "\n\n---\n\n".join(sections)
 
 
-async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_data: dict | None = None, continuation: str | None = None):
+async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_data: dict | None = None):
     """
     Forward the Forensic agent's result (+ original images, + any RAG
     grounding) to the Profiler agent, streaming its markdown report as
@@ -860,8 +659,6 @@ async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_
             f"the Forensic report's {trigger_desc}):\n"
             f"{format_rag_section(rag_data)}"
         )
-    if continuation:
-        combined_prompt += continuation
     image_parts = [
         ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
     ]
@@ -915,51 +712,7 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
                 lines=3
             )
 
-            with gr.Accordion("🖼 Examples - photos you uploaded before", open=True):
-                gr.Markdown(
-                    "Click a thumbnail to add it to **Upload Photos** above. The same photo is never added twice. "
-                    "Pick the same photos in the same order as before to find that case's saved progress."
-                )
-                example_gallery = gr.Gallery(
-                    show_label=False, columns=6, height=220, object_fit="cover",
-                    allow_preview=False, interactive=False,
-                )
-                example_paths = gr.State([])
-                with gr.Row():
-                    add_all_btn = gr.Button("➕ Add all shown (up to 15)")
-                    refresh_examples_btn = gr.Button("🔄 Refresh examples")
-
     run_btn = gr.Button("▶ Run Pipeline", variant="primary", size="large")
-
-    with gr.Row():
-        resume_mode = gr.Radio(
-            choices=[
-                ("♻️ Resume - continue partial reports", "continue"),
-                ("⏭ Resume - use partial reports as-is", "asis"),
-                ("🆕 Start fresh (discard saved progress)", "fresh"),
-            ],
-            value="continue",
-            label="Progress is saved to Postgres. If this exact case (same images + context) was run before:",
-        )
-        saved_case = gr.Dropdown(
-            choices=[], value=None, allow_custom_value=True,
-            label="...or resume a saved case (overrides the inputs above)",
-        )
-        refresh_cases = gr.Button("🔄 Refresh saved cases")
-
-    with gr.Accordion("🗑 Manage saved progress (Postgres memory)", open=False):
-        gr.Markdown(
-            "Saved cases accumulate in Postgres until you delete them. Deleting is **permanent**: "
-            "tick the box, then press one button. Image files in `temp_uploads/` are not touched. "
-            "Avoid deleting a case while it is still running."
-        )
-        delete_confirm = gr.Checkbox(label="I understand this permanently deletes saved progress", value=False)
-        with gr.Row():
-            delete_case_btn = gr.Button("🗑 Delete the case selected above")
-            older_days = gr.Number(label="Older than (days)", value=7, minimum=1, precision=0)
-            delete_old_btn = gr.Button("🧹 Delete cases older than N days")
-            delete_all_btn = gr.Button("⚠️ Delete ALL saved cases", variant="stop")
-        memory_status = gr.Textbox(label="Result", interactive=False)
 
     with gr.Row():
         with gr.Column():
@@ -981,23 +734,9 @@ with gr.Blocks(title="A2A Multi-Agent Pipeline") as demo:
     # Run button
     run_btn.click(
         fn=run_pipeline,
-        inputs=[image_input, url_input, extra_context, resume_mode, saved_case],
+        inputs=[image_input, url_input, extra_context],
         outputs=[forensic_out, profiler_out, rag_out, full_out, status_out],
-    ).then(fn=list_cases_for_ui, outputs=saved_case).then(
-        fn=refresh_examples, outputs=[example_gallery, example_paths]
     )
-    refresh_cases.click(fn=list_cases_for_ui, outputs=saved_case)
-    demo.load(fn=list_cases_for_ui, outputs=saved_case)
-    demo.load(fn=refresh_examples, outputs=[example_gallery, example_paths])
-    refresh_examples_btn.click(fn=refresh_examples, outputs=[example_gallery, example_paths])
-    example_gallery.select(fn=add_example, inputs=[image_input, example_paths], outputs=image_input)
-    add_all_btn.click(fn=add_all_examples, inputs=[image_input, example_paths], outputs=image_input)
-    delete_case_btn.click(fn=delete_selected_case_ui, inputs=[delete_confirm, saved_case],
-                          outputs=[memory_status, saved_case, delete_confirm])
-    delete_old_btn.click(fn=delete_old_cases_ui, inputs=[delete_confirm, older_days],
-                         outputs=[memory_status, saved_case, delete_confirm])
-    delete_all_btn.click(fn=delete_all_cases_ui, inputs=[delete_confirm],
-                         outputs=[memory_status, saved_case, delete_confirm])
 
     gr.Markdown("**Tip:** You can upload an image **and** add extra context text.")
 

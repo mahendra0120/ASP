@@ -6,7 +6,6 @@ Counterpart to A2A_profiler_server.py — see that file's docstring for
 why Profiler and Forensic are split into separate processes rather
 than run together via asyncio.gather() in one.
 """
-import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE / ports; must run before huggingface_hub is imported)
 
 import asyncio
 import logging
