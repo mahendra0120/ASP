@@ -369,6 +369,42 @@ def query(text: str, top_k: int = 5) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════
+#  Single best-matching reference file (for full-file loading)
+# ════════════════════════════════════════════════════════════════
+
+def select_primary_source(results: list[dict]) -> Optional[str]:
+    """
+    Pick the ONE forensic_knowledge/*.md file that best matches a query,
+    given query()'s retrieved chunks: the file whose chunks have the
+    highest summed similarity score (so a file with several good chunks
+    beats a file with a single slightly better one). Returns None if
+    there are no usable chunks.
+    """
+    totals: dict[str, float] = {}
+    for r in results:
+        src = r.get("source")
+        if src and r.get("text", "").strip():
+            totals[src] = totals.get(src, 0.0) + float(r.get("score", 0.0))
+    return max(totals, key=totals.get) if totals else None
+
+
+def load_full_source_text(
+    source: str, knowledge_dir: Path = FORENSIC_KNOWLEDGE_DIR,
+) -> Optional[str]:
+    """
+    Read the COMPLETE text of one forensic_knowledge/*.md file by its
+    `source` name (e.g. "Gunshot_wounds.md"). Only a bare filename inside
+    forensic_knowledge/ is honoured (any directory part is stripped), so
+    a crafted `source` can't read files elsewhere. Returns None if the
+    file doesn't exist or isn't a .md file.
+    """
+    path = knowledge_dir / Path(source).name
+    if path.suffix.lower() != ".md" or not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+# ════════════════════════════════════════════════════════════════
 #  Keyword trigger — shared logic
 #
 #  Same case-insensitive, whole-phrase matching used by
@@ -472,8 +508,10 @@ TRAUMA_TRIGGER_KEYWORDS: list[str] = [
 ]
 
 
+# Matches "## Evidence of Trauma" and the newer "## Evidence of Trauma (EOT)"
+# (also a bare "## EOT"), so reports in either format are read.
 EVIDENCE_OF_TRAUMA_HEADING_RE = re.compile(
-    r"^#{1,6}\s*evidence of trauma\s*$",
+    r"^#{1,6}\s*(?:evidence of trauma(?:\s*\(\s*eot\s*\))?|eot)\s*:?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -599,6 +637,84 @@ def extract_trigger_context(text: str, matched_keywords: list[str], window: int 
     return " ".join(sentences[i] for i in sorted(hit_indices))
 
 
+# Which trauma categories count as a distinct "trauma", and the reference file
+# that covers each. "general" (catch-all wording) and "postmortem_and_natural"
+# (not injuries) are deliberately NOT counted, so they never add a file.
+TRAUMA_CATEGORY_FILES: dict[str, str] = {
+    "gunshot":     "Gunshot_wounds.md",
+    "sharp_force": "sharp_force_injury.md",
+    "asphyxia":    "asphyxiation.md",
+    "thermal":     "Thermal_injuries.md",
+    "blunt_force": "Blunt_Force_Trauma.md",
+}
+
+
+# The Forensic agent's EOT list labels every injury "Type: <Gunshot | Sharp force |
+# Blunt force | Asphyxia | Thermal | Other>". Those labels are the most reliable
+# way to count distinct trauma types, so they take priority over keyword scanning.
+_TYPE_LABEL_TO_CATEGORY: list[tuple[str, str]] = [
+    ("sharp force", "sharp_force"), ("blunt force", "blunt_force"),
+    ("gunshot", "gunshot"), ("firearm", "gunshot"),
+    ("asphyx", "asphyxia"), ("thermal", "thermal"), ("burn", "thermal"),
+    ("sharp", "sharp_force"), ("blunt", "blunt_force"),
+]
+_TYPE_LABEL_RE = re.compile(
+    r"^[\s>*\-\d.)]*\**\s*type\s*\**\s*[:\-\u2013\u2014]\s*\**\s*([A-Za-z][A-Za-z \-]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _labelled_categories(text: str) -> list[str]:
+    """Trauma categories named by explicit 'Type: ...' labels, in order of first appearance."""
+    cats: list[str] = []
+    for m in _TYPE_LABEL_RE.finditer(text):
+        label = m.group(1).strip().lower()
+        for key, category in _TYPE_LABEL_TO_CATEGORY:
+            if label.startswith(key):
+                if category not in cats:
+                    cats.append(category)
+                break
+    return cats
+
+
+def select_trauma_sources(text: str, knowledge_dir: Path = FORENSIC_KNOWLEDGE_DIR) -> list[str]:
+    """
+    One reference file per DISTINCT trauma type the report describes.
+
+    If the EOT list carries explicit "Type: ..." labels, those decide. Otherwise
+    scans `text` (the report's "Evidence of Trauma" section) for each trauma
+    category's vocabulary, ignoring negated mentions ("no burns", "without
+    ligature marks"). Every category that is found contributes its file, so a
+    report describing a gunshot wound and a ligature mark yields two files,
+    and one describing only a stab wound yields one. Files are returned in
+    the order the traumas first appear in the text. A category whose file is
+    missing from forensic_knowledge/ is skipped. [] if no category is found.
+    """
+    # Preferred: the agent's own "Type:" labels (one per injury). Only if there
+    # are none that name a known category do we fall back to scanning vocabulary.
+    labelled = [
+        TRAUMA_CATEGORY_FILES[c] for c in _labelled_categories(text)
+        if c in TRAUMA_CATEGORY_FILES and (knowledge_dir / TRAUMA_CATEGORY_FILES[c]).is_file()
+    ]
+    if labelled:
+        return labelled
+
+    lowered = text.lower()
+    found: list[tuple[int, str]] = []
+    for category, filename in TRAUMA_CATEGORY_FILES.items():
+        if not (knowledge_dir / filename).is_file():
+            continue
+        hit = check_keyword_trigger(text, TRAUMA_KEYWORD_CATEGORIES[category])
+        if not hit["triggered"]:
+            continue
+        pos = min(
+            (lowered.find(kw.lower()) for kw in hit["matched_keywords"] if kw.lower() in lowered),
+            default=len(lowered),
+        )
+        found.append((pos, filename))
+    return [filename for _, filename in sorted(found)]
+
+
 def check_trauma_and_retrieve(text: str, top_k: int = 5) -> dict:
     """
     One-shot helper for the orchestrator: decide whether the Forensic
@@ -630,6 +746,8 @@ def check_trauma_and_retrieve(text: str, top_k: int = 5) -> dict:
           "query": str | None,            # what was searched, if triggered
           "results": [{"text","source","score"}, ...],  # [] if not triggered
           "corpus_size": int,
+          "primary_source": str | None,   # the single best-matching .md file (by similarity), when triggered
+          "trauma_sources": [str, ...],   # one .md file per distinct trauma type in the report ([] if none recognised)
         }
     """
     section = extract_evidence_of_trauma_section(text)
@@ -647,6 +765,8 @@ def check_trauma_and_retrieve(text: str, top_k: int = 5) -> dict:
             "triggered": True, "source": "evidence_of_trauma_section",
             "matched_keywords": [], "checked_keywords": [],
             "query": section, **retrieval,
+            "primary_source": select_primary_source(retrieval["results"]),
+            "trauma_sources": select_trauma_sources(section),
         }
 
     # Fallback: no "## Evidence of Trauma" section found in the report.
@@ -656,7 +776,9 @@ def check_trauma_and_retrieve(text: str, top_k: int = 5) -> dict:
 
     search_query = extract_trigger_context(text, trigger["matched_keywords"])
     retrieval = query(search_query, top_k=top_k)
-    return {**trigger, "source": "keyword_fallback", "query": search_query, **retrieval}
+    return {**trigger, "source": "keyword_fallback", "query": search_query, **retrieval,
+            "primary_source": select_primary_source(retrieval["results"]),
+            "trauma_sources": select_trauma_sources(text)}
 
 
 if __name__ == "__main__":
