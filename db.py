@@ -1,25 +1,16 @@
 """
-db.py
-─────────────────────────────────────────────────────────────────
-PostgreSQL-backed persistence for agent results.
+db.py — PostgreSQL persistence for pipeline checkpoints.
 
-Replaces the old in-memory `_store: dict[str, Any] = {}` placeholder
-that used to live in Image_delegation_mcp.py. Results are keyed by
-(task_id, agent_id) — task_id is the uuid4 generated per-run in
-main.py — and are now durable across process restarts and shared
-correctly between the MCP server and A2A agent processes (the old
-dict was process-local, so it silently failed to share state once
-the agents ran as separate subprocesses).
+One row per (case_id, step). `step` is one of: meta, forensic, rag, education,
+profiler, final (plus profiler_failed, a quarantined bad Profiler output).
+`status` is 'partial' (text streamed so far) or 'complete'. A finished step is
+never overwritten by a late partial save (see save_step's WHERE clause).
 
-Configure via the DATABASE_URL env var, e.g.:
-    postgresql://asp_user:asp_password@localhost:5432/asp
-
-A single asyncpg pool is created lazily on first use and reused for
-the lifetime of the process.
+Configure with DATABASE_URL (default matches setup_postgres.sh). One asyncpg
+pool is created lazily and reused for the life of the process.
 """
 
 import os
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
@@ -32,12 +23,13 @@ DATABASE_URL = os.getenv(
 _pool: Optional[asyncpg.Pool] = None
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS agent_results (
-    task_id     TEXT NOT NULL,
-    agent_id    TEXT NOT NULL,
-    result      TEXT NOT NULL,
-    stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (task_id, agent_id)
+CREATE TABLE IF NOT EXISTS pipeline_steps (
+    case_id     TEXT NOT NULL,
+    step        TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('partial', 'complete')),
+    content     TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (case_id, step)
 );
 """
 
@@ -51,76 +43,7 @@ async def get_pool() -> asyncpg.Pool:
         )
         async with _pool.acquire() as conn:
             await conn.execute(_SCHEMA)
-            await conn.execute(_PIPELINE_SCHEMA)
     return _pool
-
-
-async def close_pool() -> None:
-    """Close the pool cleanly, e.g. on server shutdown."""
-    global _pool
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
-
-
-async def store_result(task_id: str, agent_id: str, result: str) -> dict[str, Any]:
-    """Persist (or overwrite) an agent result under (task_id, agent_id)."""
-    pool = await get_pool()
-    stored_at = datetime.now(timezone.utc)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO agent_results (task_id, agent_id, result, stored_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (task_id, agent_id)
-            DO UPDATE SET result = EXCLUDED.result, stored_at = EXCLUDED.stored_at
-            """,
-            task_id, agent_id, result, stored_at,
-        )
-    return {"stored": True, "key": f"{task_id}:{agent_id}"}
-
-
-async def get_result(task_id: str, agent_id: str) -> dict[str, Any]:
-    """Retrieve a stored agent result by task_id + agent_id."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT result, stored_at, agent_id
-            FROM agent_results
-            WHERE task_id = $1 AND agent_id = $2
-            """,
-            task_id, agent_id,
-        )
-    if row is None:
-        return {"found": False}
-    return {
-        "found": True,
-        "result": row["result"],
-        "stored_at": row["stored_at"].isoformat(),
-        "agent_id": row["agent_id"],
-    }
-
-
-# ════════════════════════════════════════════════════════════════
-#  Pipeline checkpoints (crash recovery)
-# ════════════════════════════════════════════════════════════════
-#
-# One row per (case_id, step). `step` is one of: meta, forensic, rag,
-# profiler, final. `status` is 'partial' (text streamed so far, saved
-# periodically and on failure) or 'complete'. A finished step is never
-# overwritten by a late partial save (see save_step's WHERE clause).
-
-_PIPELINE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS pipeline_steps (
-    case_id     TEXT NOT NULL,
-    step        TEXT NOT NULL,
-    status      TEXT NOT NULL CHECK (status IN ('partial', 'complete')),
-    content     TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (case_id, step)
-);
-"""
 
 
 async def save_step(case_id: str, step: str, content: str, status: str) -> bool:
@@ -161,14 +84,6 @@ async def load_steps(case_id: str) -> dict[str, dict[str, Any]]:
     }
 
 
-async def delete_case(case_id: str) -> None:
-    """Forget a case entirely (used by 'Start fresh')."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM pipeline_steps WHERE case_id = $1", case_id)
-        await conn.execute("DELETE FROM agent_results WHERE task_id = $1", case_id)
-
-
 async def delete_steps(case_id: str, steps: list[str]) -> None:
     """Drop specific steps (e.g. downstream results made stale by a regenerated Forensic report)."""
     pool = await get_pool()
@@ -207,21 +122,16 @@ async def list_cases(limit: int = 25) -> list[dict[str, Any]]:
     ]
 
 
-# ── memory management ───────────────────────────────────────────
-# These only ever touch pipeline cases (and their published copies in
-# agent_results). Rows other MCP clients wrote to agent_results under
-# their own task ids are left alone.
+# ── memory management (UI delete buttons) ────────────────────────
 
 async def forget_case(case_id: str) -> int:
     """Delete one case. Returns how many saved steps it had."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            n = await conn.fetchval(
-                "WITH d AS (DELETE FROM pipeline_steps WHERE case_id = $1 RETURNING 1) SELECT count(*) FROM d",
-                case_id,
-            )
-            await conn.execute("DELETE FROM agent_results WHERE task_id = $1", case_id)
+        n = await conn.fetchval(
+            "WITH d AS (DELETE FROM pipeline_steps WHERE case_id = $1 RETURNING 1) SELECT count(*) FROM d",
+            case_id,
+        )
     return int(n or 0)
 
 
@@ -229,32 +139,25 @@ async def delete_cases_older_than(days: int) -> int:
     """Delete every case whose most recent activity is older than `days` days. Returns cases removed."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            ids = [
-                r["case_id"]
-                for r in await conn.fetch(
-                    """
+        ids = [
+            r["case_id"]
+            for r in await conn.fetch(
+                """
+                DELETE FROM pipeline_steps WHERE case_id IN (
                     SELECT case_id FROM pipeline_steps
                      GROUP BY case_id
                     HAVING max(updated_at) < now() - make_interval(days => $1)
-                    """,
-                    int(days),
-                )
-            ]
-            if ids:
-                await conn.execute("DELETE FROM pipeline_steps WHERE case_id = ANY($1::text[])", ids)
-                await conn.execute("DELETE FROM agent_results WHERE task_id = ANY($1::text[])", ids)
-    return len(ids)
+                ) RETURNING case_id
+                """,
+                int(days),
+            )
+        ]
+    return len(set(ids))
 
 
 async def delete_all_cases() -> int:
     """Delete every saved pipeline case. Returns cases removed."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            ids = [r["case_id"] for r in await conn.fetch("SELECT DISTINCT case_id FROM pipeline_steps")]
-            if ids:
-                await conn.execute("DELETE FROM pipeline_steps WHERE case_id = ANY($1::text[])", ids)
-                await conn.execute("DELETE FROM agent_results WHERE task_id = ANY($1::text[])", ids)
-    return len(ids)
-
+        rows = await conn.fetch("DELETE FROM pipeline_steps RETURNING case_id")
+    return len({r["case_id"] for r in rows})

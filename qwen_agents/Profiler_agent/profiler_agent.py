@@ -132,7 +132,7 @@ _SKILL_MD = _load_skill_text(PROFILER_SKILL)
 _OUTPUT_MD = _load_skill_text(CBA_SKILL_DIR / "references" / "OUTPUT.md")
 
 
-profile_agent: Agent[None, str] = Agent(
+profiler_agent: Agent[None, str] = Agent(
     model=make_model(
         PROFILER_MODEL_ID,
         processor_path="Qwen/Qwen3-VL-8B-Thinking",

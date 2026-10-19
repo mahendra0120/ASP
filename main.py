@@ -1,28 +1,38 @@
 """
-main_gradio.py - Enhanced with Image Upload + Extra Context
+main.py — Gradio UI + orchestration for the Forensic -> (RAG || Profiler) pipeline.
+
+Each agent runs as its own A2A server subprocess (a2a_server.py). Every pipeline step is
+checkpointed to Postgres (pipeline_state.py / db.py) so a crashed run can be resumed.
 """
 import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE / ports; must run before huggingface_hub is imported)
 
-import os
 import asyncio
 import json
 import logging
 import mimetypes
+import os
 import re
+import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import aclosing
 from pathlib import Path
-import shutil
 
 import gradio as gr
-import pipeline_state as pstate
-import example_images
 import httpx
-from dotenv import load_dotenv
+
+import example_images
+import octen_rag
+import pipeline_state as pstate
+from a2a_client import (
+    A2AMessage, TextPart, ImagePart,
+    PROFILER_AGENT, FORENSIC_AGENT,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,40 +41,35 @@ logging.basicConfig(
 )
 log = logging.getLogger("pipeline")
 
-from A2A_image_delegation_client import (
-    A2AMessage, TextPart, ImagePart,
-    PROFILER_AGENT, FORENSIC_AGENT,
-)
-import octen_rag
-
-load_dotenv()
-
-# Global variables
-mcp_proc = None
-profiler_proc = None
-forensic_proc = None
 REPO_ROOT = Path(__file__).resolve().parent
+LOG_DIR = REPO_ROOT / "server_logs"
 TEMP_IMAGE_DIR = Path("temp_uploads")
 TEMP_IMAGE_DIR.mkdir(exist_ok=True)
 
-MCP_PORT = int(os.getenv("MCP_SERVER_PORT", "9000"))
 PROFILER_PORT = int(os.getenv("PROFILER_AGENT_PORT", "8011"))
 FORENSIC_PORT = int(os.getenv("FORENSIC_AGENT_PORT", "8002"))
+AGENT_PORTS = {"Profiler": PROFILER_PORT, "Forensic": FORENSIC_PORT}
+
+# Loading an ~8B-parameter checkpoint is much slower than a typical web-service start,
+# especially on a cold cache, so wait long for the ports. Tunable per machine.
+SERVER_READY_TIMEOUT = float(os.getenv("SERVER_READY_TIMEOUT_SECONDS", "300"))
+
+MAX_IMAGES = 15
+
+# Per-request user text sent with the case images; the real task instructions live in
+# forensic_agent.py's system prompt.
+FORENSIC_USER_MESSAGE = "Analyze the attached autopsy photograph(s) and produce your forensic report."
 
 
 # =============================================
 # GPU placement
 # =============================================
-# Each agent server loads its model with device_map="cuda", i.e. onto whichever
-# GPU that PROCESS can see. So placing an agent on a GPU = setting
-# CUDA_VISIBLE_DEVICES for its subprocess:
-#   * 2+ GPUs  -> Forensic on the first, Profiler on the second. The Forensic
-#                 agent (writing the reference summaries) and the Profiler then run
-#                 truly in parallel instead of time-slicing one GPU.
-#   * 1 GPU    -> nothing is set; both share it exactly as before.
-#   * no GPU / nvidia-smi + torch unavailable -> nothing is set.
-# Overrides: FORENSIC_GPU / PROFILER_GPU pin an agent to a GPU index or UUID
-# (set both); ASP_MULTI_GPU=false forces the shared-GPU layout.
+# Each agent server loads its model with device_map="cuda", i.e. onto whichever GPU that
+# PROCESS can see, so placing an agent = setting CUDA_VISIBLE_DEVICES for its subprocess:
+#   * 2+ GPUs -> Forensic on the first, Profiler on the second (true parallelism).
+#   * 1 GPU / none detected -> nothing set; both share it.
+# Overrides: FORENSIC_GPU / PROFILER_GPU pin an agent to a GPU index or UUID (set both);
+# ASP_MULTI_GPU=false forces the shared-GPU layout.
 
 def _detect_gpus() -> list[str]:
     """IDs (valid CUDA_VISIBLE_DEVICES tokens) of the GPUs this app may use.
@@ -91,8 +96,7 @@ def _detect_gpus() -> list[str]:
 
 
 def plan_gpu_placement() -> dict[str, str | None]:
-    """{"Forensic": gpu_or_None, "Profiler": gpu_or_None}. None = don't touch
-    CUDA_VISIBLE_DEVICES (the agent uses whatever GPU the app itself sees)."""
+    """{"Forensic": gpu_or_None, "Profiler": gpu_or_None}. None = leave CUDA_VISIBLE_DEVICES alone."""
     forensic = os.getenv("FORENSIC_GPU", "").strip() or None
     profiler = os.getenv("PROFILER_GPU", "").strip() or None
     multi_ok = os.getenv("ASP_MULTI_GPU", "true").strip().lower() not in ("false", "0", "no")
@@ -119,34 +123,16 @@ def _gpu_tag(name: str) -> str:
     gpu = (_gpu_placement or {}).get(name)
     return f" (GPU {gpu})" if gpu is not None else ""
 
-# Sent as the per-request user-turn text alongside the case images. The
-# actual task instructions (autopsy-only framing, the <think> block, the
-# required output sections) now live in forensic_agent.py's system_prompt
-# — this is just the minimal turn needed to hand the images over, since
-# the "Main Prompt" textbox has been removed from the UI below.
-FORENSIC_USER_MESSAGE = "Analyze the attached autopsy photograph(s) and produce your forensic report."
-
-
-def guess_image_media_type(url_or_path: str) -> str:
-    """
-    Best-effort MIME type detection from a filename/URL extension.
-    Falls back to image/jpeg if nothing recognizable is found, since
-    the A2A file part needs a concrete media_type for the receiving
-    agent to correctly classify it as an image.
-    """
-    mime_type, _ = mimetypes.guess_type(url_or_path)
-    if mime_type and mime_type.startswith("image/"):
-        return mime_type
-    return "image/jpeg"
-
 
 # =============================================
-# Server Management (unchanged)
+# Server management
 # =============================================
+
+agent_procs: dict[str, subprocess.Popen] = {}
+
 
 def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
-    """Quick TCP connect check — used to confirm a subprocess is actually
-    listening rather than trusting that Popen() returning means it's up."""
+    """TCP connect check: confirms a subprocess is actually listening, not just spawned."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -155,8 +141,7 @@ def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool
 
 
 def _wait_for_ports(ports: dict[str, int], timeout: float = 60.0, interval: float = 1.0) -> dict[str, bool]:
-    """Poll a set of {label: port} until each is open or `timeout` elapses.
-    Returns {label: reached_or_not}."""
+    """Poll {label: port} until each is open or `timeout` elapses. Returns {label: reached}."""
     remaining = dict(ports)
     deadline = time.monotonic() + timeout
     ready: dict[str, bool] = {}
@@ -176,96 +161,59 @@ def _process_alive(proc: subprocess.Popen | None) -> bool:
     return proc is not None and proc.poll() is None
 
 
-# Loading a ~8B-parameter vision-language checkpoint (even at 4-bit —
-# see qwen_agents/model_utils.py) through unsloth is a lot slower than a
-# typical web-service startup, especially on a cold cache or modest
-# GPU/CPU. 60s was tuned for "did the process fail to bind a socket",
-# not "is a multi-billion-parameter model still loading" — those are
-# different questions with different acceptable timeouts. Configurable
-# via env var so it can be tuned per-machine without editing code.
-SERVER_READY_TIMEOUT = float(os.getenv("SERVER_READY_TIMEOUT_SECONDS", "300"))
+def _watch_exit(name: str, proc: subprocess.Popen) -> None:
+    """Record how an agent server exited (e.g. SIGKILL from the OOM killer) in server_logs/exit_codes.log."""
+    def _wait():
+        rc = proc.wait()
+        try:
+            sig = signal.Signals(-rc).name if rc < 0 else ""
+        except ValueError:
+            sig = ""
+        msg = (f"[server-watch] {name} exited: returncode={rc} {sig} "
+               f"at {time.strftime('%H:%M:%S')} (expected if you pressed Stop)")
+        print(msg, flush=True)
+        with open(LOG_DIR / "exit_codes.log", "a") as f:
+            f.write(msg + "\n")
+
+    threading.Thread(target=_wait, daemon=True).start()
 
 
-def _watch_server_exits(procs: dict, logdir) -> None:
-    import signal as _signal
-    import threading
-
-    def _loop():
-        reported = set()
-        while len(reported) < len(procs):
-            for name, proc in procs.items():
-                if proc is None or name in reported:
-                    continue
-                rc = proc.poll()
-                if rc is None:
-                    continue
-                reported.add(name)
-                try:
-                    sig = _signal.Signals(-rc).name if rc < 0 else ""
-                except ValueError:
-                    sig = ""
-                msg = (f"[server-watch] {name} exited: returncode={rc} {sig} "
-                       f"at {time.strftime('%H:%M:%S')} (expected if you pressed Stop)")
-                print(msg, flush=True)
-                with open(Path(logdir) / "exit_codes.log", "a") as f:
-                    f.write(msg + "\n")
-            time.sleep(1)
-
-    threading.Thread(target=_loop, daemon=True).start()
+def _spawn_agent(name: str) -> Path:
+    """Start one agent server subprocess. Its output goes to server_logs/<name>_server.log;
+    the previous run's log is kept as .prev (it may hold the crash trace). Returns the log path."""
+    LOG_DIR.mkdir(exist_ok=True)
+    logfile = LOG_DIR / f"{name.lower()}_server.log"
+    if logfile.exists():
+        os.replace(logfile, logfile.with_name(logfile.name + ".prev"))
+    agent_procs[name] = subprocess.Popen(
+        [sys.executable, str(REPO_ROOT / "a2a_server.py"), name.lower()],
+        stdout=open(logfile, "w"), stderr=subprocess.STDOUT,
+        cwd=str(REPO_ROOT), env=_agent_env(name),
+    )
+    _watch_exit(name, agent_procs[name])
+    return logfile
 
 
 def launch_servers():
     """
-    Start the MCP tools server, the Profiler A2A server, and the
-    Forensic A2A server as three SEPARATE subprocesses, then actually
-    verify they came up before reporting success.
+    Start the Profiler and Forensic A2A servers as two SEPARATE subprocesses, then verify
+    they came up (per-service success/failure, not a blanket "started").
 
-    Profiler and Forensic used to be started together as a single
-    combined process (A2A_image_delegation_server.py, run via
-    asyncio.gather). That process loads both agents' ~8B-parameter
-    checkpoints at import time, sequentially, before either uvicorn
-    server binds its port — so:
-      - Startup routinely exceeded the old 60s timeout for BOTH ports
-        at once, even when nothing was actually broken (just still
-        loading).
-      - A crash loading or running either model (e.g. a CUDA OOM from
-        two full-precision ~8B models sharing one GPU) took the other
-        agent down with it, since they were one OS process.
-    Running A2A_profiler_server.py and A2A_forensic_server.py as two
-    separate processes fixes both: their model loads now happen in
-    parallel instead of one after the other, and a crash in one is
-    isolated to that one port/process — the other keeps serving, and
-    the failure is reported against the specific process that died
-    rather than a shared, ambiguous one.
-
-    Other fixes over the original version, which just called Popen()
-    and immediately reported "started" regardless of what actually
-    happened:
-      - Uses absolute paths (REPO_ROOT / "<file>.py") and sets `cwd`
-        explicitly, so this no longer depends on whatever directory
-        the Gradio app process happens to have been launched from.
-      - Refuses to double-launch if a server from a previous click is
-        still alive.
-      - Captures each subprocess's stdout/stderr to its own log file
-        (rather than an unread PIPE, which can eventually deadlock a
-        subprocess once its output buffer fills) and polls the actual
-        ports until they're open (or SERVER_READY_TIMEOUT elapses),
-        reporting per-service success/failure instead of a blanket
-        "started".
+    Separate processes load their models in parallel and isolate crashes (e.g. a CUDA OOM
+    in one leaves the other serving). Output is captured to per-service log files rather
+    than an unread PIPE, which can eventually deadlock a subprocess once its buffer fills.
     """
-    global mcp_proc, profiler_proc, forensic_proc
+    global _gpu_placement
 
-    if _process_alive(mcp_proc) and _process_alive(profiler_proc) and _process_alive(forensic_proc):
+    if len(agent_procs) == len(AGENT_PORTS) and all(_process_alive(p) for p in agent_procs.values()):
         return "ℹ️ Servers already running — stop them first if you want to restart."
 
-    mcp_script = REPO_ROOT / "Image_delegation_mcp.py"
-    profiler_script = REPO_ROOT / "A2A_profiler_server.py"
-    forensic_script = REPO_ROOT / "A2A_forensic_server.py"
-    missing = [p.name for p in (mcp_script, profiler_script, forensic_script) if not p.exists()]
-    if missing:
-        return f"❌ Server launch failed: missing file(s) in {REPO_ROOT}: {', '.join(missing)}"
+    # Invalidate the cached RAG index so the first query after startup reflects the current
+    # corpus and chunking logic. Set RAG_REBUILD_ON_STARTUP=false to keep it across restarts.
+    if os.getenv("RAG_REBUILD_ON_STARTUP", "true").strip().lower() not in ("false", "0", "no"):
+        if octen_rag.clear_index_cache():
+            log.info("Cleared cached RAG index (.octen_faiss_index/) - it will rebuild on first use.")
 
-    global _gpu_placement
     _gpu_placement = plan_gpu_placement()
     if _gpu_placement["Forensic"] is not None or _gpu_placement["Profiler"] is not None:
         log.info(
@@ -275,164 +223,84 @@ def launch_servers():
     else:
         log.info("GPU placement: not split (one GPU, none detected, or ASP_MULTI_GPU=false) - agents share the default GPU")
 
-    log_dir = REPO_ROOT / "server_logs"
-    log_dir.mkdir(exist_ok=True)
-    mcp_logfile = log_dir / "mcp_server.log"
-    profiler_logfile = log_dir / "profiler_server.log"
-    forensic_logfile = log_dir / "forensic_server.log"
-
-    # Start each run with a clean slate: delete the previous run's log
-    # files before opening new ones. These used to be opened in append
-    # ("a") mode, so every restart just kept piling new output onto
-    # whatever the last run (successful or crashed) had already
-    # written — making it easy to misread an old crash's traceback as
-    # belonging to the current run, or to scroll past a huge log
-    # thinking nothing new was written. Deleting first (then opening
-    # in "w") guarantees each log file contains only the run that's
-    # about to start.
-    for logfile in (mcp_logfile, profiler_logfile, forensic_logfile):
-        if logfile.exists():
-            os.replace(logfile, logfile.with_name(logfile.name + '.prev'))
-
-    mcp_log = open(mcp_logfile, "w")
-    profiler_log = open(profiler_logfile, "w")
-    forensic_log = open(forensic_logfile, "w")
-
     try:
-        mcp_proc = subprocess.Popen(
-            [sys.executable, str(mcp_script)],
-            stdout=mcp_log, stderr=subprocess.STDOUT,
-            cwd=str(REPO_ROOT),
-        )
-        profiler_proc = subprocess.Popen(
-            [sys.executable, str(profiler_script)],
-            stdout=profiler_log, stderr=subprocess.STDOUT,
-            cwd=str(REPO_ROOT), env=_agent_env("Profiler"),
-        )
-        forensic_proc = subprocess.Popen(
-            [sys.executable, str(forensic_script)],
-            stdout=forensic_log, stderr=subprocess.STDOUT,
-            cwd=str(REPO_ROOT), env=_agent_env("Forensic"),
-        )
+        logfiles = {name: _spawn_agent(name) for name in AGENT_PORTS}
     except Exception as e:
         return f"❌ Server launch failed: {e}"
 
-    _watch_server_exits(
-        {"MCP": mcp_proc, "Profiler": profiler_proc, "Forensic": forensic_proc}, log_dir
-    )
+    ready = _wait_for_ports(AGENT_PORTS, timeout=SERVER_READY_TIMEOUT)
 
-    ready = _wait_for_ports(
-        {"MCP": MCP_PORT, "Profiler": PROFILER_PORT, "Forensic": FORENSIC_PORT},
-        timeout=SERVER_READY_TIMEOUT,
-    )
-
-    # A process that already exited tells us more than "port never opened"
-    # — surface that explicitly, and point at the log file to read why.
-    # Each service now has its own process and its own log file, so this
-    # correctly attributes a Forensic crash to Forensic alone instead of
-    # implicating Profiler too.
+    # A process that already exited tells us more than "port never opened": say so and
+    # point at the log that explains why.
     lines = []
-    for label, port, proc, logfile in (
-        ("MCP", MCP_PORT, mcp_proc, mcp_logfile),
-        ("Profiler", PROFILER_PORT, profiler_proc, profiler_logfile),
-        ("Forensic", FORENSIC_PORT, forensic_proc, forensic_logfile),
-    ):
+    for label, port in AGENT_PORTS.items():
         if ready.get(label):
             lines.append(f"✅ {label}:{port}{_gpu_tag(label)}")
-        elif not _process_alive(proc):
-            lines.append(f"❌ {label}:{port} — process exited early (see {logfile})")
+        elif not _process_alive(agent_procs[label]):
+            lines.append(f"❌ {label}:{port} — process exited early (see {logfiles[label]})")
         else:
-            lines.append(f"⚠️ {label}:{port} — not responding after {int(SERVER_READY_TIMEOUT)}s (see {logfile})")
+            lines.append(f"⚠️ {label}:{port} — not responding after {int(SERVER_READY_TIMEOUT)}s (see {logfiles[label]})")
 
     return "\n".join(lines)
 
 
 def stop_servers():
-    global mcp_proc, profiler_proc, forensic_proc
     stopped = []
-    for name, proc in (("MCP", mcp_proc), ("Profiler", profiler_proc), ("Forensic", forensic_proc)):
-        if proc:
-            proc.terminate()
-            try:
-                proc.wait(5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            stopped.append(name)
-    mcp_proc = None
-    profiler_proc = None
-    forensic_proc = None
+    for name, proc in agent_procs.items():
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        stopped.append(name)
+    agent_procs.clear()
     return f"🛑 Stopped: {', '.join(stopped)}" if stopped else "ℹ️ No servers were running."
 
 
+async def _ensure_agent_up(name: str) -> None:
+    """Crash recovery: restart ONLY the named agent server if it isn't listening
+    (launch_servers() would relaunch both and orphan the healthy one)."""
+    port = AGENT_PORTS[name]
+    if _port_open(port):
+        return
+    log.warning(f"{name} agent server is not listening on :{port} - restarting just that server")
+    logfile = await asyncio.to_thread(_spawn_agent, name)
+    ready = await asyncio.to_thread(_wait_for_ports, {name: port}, SERVER_READY_TIMEOUT)
+    log.info(f"✅ {name}:{port} restarted" if ready.get(name) else f"⚠️ {name}:{port} did not come up (see {logfile})")
+
+
 # =============================================
-# Helper: Save uploaded image and return URL
+# Uploaded images
 # =============================================
 
-MAX_IMAGES = 15
+def guess_image_media_type(url_or_path: str) -> str:
+    """MIME type from the file extension, defaulting to image/jpeg: the A2A file part needs
+    a concrete media_type for the receiving agent to classify it as an image."""
+    mime_type, _ = mimetypes.guess_type(url_or_path)
+    if mime_type and mime_type.startswith("image/"):
+        return mime_type
+    return "image/jpeg"
 
 
 def save_uploaded_images(images) -> list[str]:
-    """
-    Save one or more uploaded images and return their local URLs.
-    `images` is whatever gr.File(file_count="multiple") hands back —
-    a list of tempfile-like objects (or plain path strings depending
-    on Gradio version). Returns [] if nothing was uploaded.
-    """
-    if not images:
-        return []
-
+    """Copy uploaded images (whatever gr.File hands back: tempfile-likes or path strings)
+    into temp_uploads/ and return their local URLs. [] if nothing was uploaded."""
     urls = []
-    for image in images:
+    for image in images or []:
         temp_path = TEMP_IMAGE_DIR / f"{uuid.uuid4()}_{Path(image.name).name if hasattr(image, 'name') else 'image.jpg'}"
         shutil.copy(image.name if hasattr(image, 'name') else image, temp_path)
         urls.append(f"http://127.0.0.1:7860/gradio_api/file={temp_path}")
         log.info(f"Image received and saved -> {temp_path.name}")
-
     return urls
+
+
+def _image_parts(image_urls: list[str]) -> list[ImagePart]:
+    return [ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls]
 
 
 # =============================================
 # Pipeline
 # =============================================
-
-def _start_single_agent(name: str) -> str:
-    """Start ONLY the named agent server (crash recovery). launch_servers() would
-    relaunch all three and orphan the ones that are still healthy."""
-    global profiler_proc, forensic_proc
-    script, port, logname = {
-        "Forensic": ("A2A_forensic_server.py", FORENSIC_PORT, "forensic_server.log"),
-        "Profiler": ("A2A_profiler_server.py", PROFILER_PORT, "profiler_server.log"),
-    }[name]
-    path = REPO_ROOT / script
-    if not path.exists():
-        return f"❌ {name}: missing {script}"
-    log_dir = REPO_ROOT / "server_logs"
-    log_dir.mkdir(exist_ok=True)
-    logfile = log_dir / logname
-    if logfile.exists():                      # keep the dead server's log (it holds the crash trace)
-        os.replace(logfile, logfile.with_name(logfile.name + ".prev"))
-    proc = subprocess.Popen(
-        [sys.executable, str(path)],
-        stdout=open(logfile, "w"), stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
-        env=_agent_env(name),
-    )
-    if name == "Forensic":
-        forensic_proc = proc
-    else:
-        profiler_proc = proc
-    if "_watch_server_exits" in globals():
-        _watch_server_exits({name: proc}, log_dir)
-    ready = _wait_for_ports({name: port}, timeout=SERVER_READY_TIMEOUT)
-    return f"✅ {name}:{port} restarted" if ready.get(name) else f"⚠️ {name}:{port} did not come up (see {logfile})"
-
-
-async def _ensure_agent_up(name: str) -> None:
-    port = FORENSIC_PORT if name == "Forensic" else PROFILER_PORT
-    if _port_open(port):
-        return
-    log.warning(f"{name} agent server is not listening on :{port} - restarting just that server")
-    log.info(await asyncio.to_thread(_start_single_agent, name))
-
 
 async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id: str, resume_mode: str = "continue"):
     """
@@ -441,20 +309,16 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
       "continue" - reuse finished steps, continue partial reports where they stopped
       "asis"     - reuse finished steps, accept partial reports as they are
       "fresh"    - discard saved progress for this case and start over
+    Yields (forensic, profiler, reference summaries, final report, status) for the UI.
     """
-    forensic_text = ""
-    profiler_text = ""
-    rag_text = ""
-    edu_text = ""
-    final_text = ""
+    forensic_text = profiler_text = rag_text = edu_text = ""
     store = pstate.CaseStore(case_id)
 
-    def S(msg: str) -> str:
-        return msg + store.status_suffix()
+    def panels(msg: str, final: str = ""):
+        """The 5 UI outputs. The reference-summaries panel shows the summaries once they exist."""
+        return forensic_text, profiler_text, edu_text or rag_text, final, msg + store.status_suffix()
 
     try:
-        task_id = case_id
-
         forensic_message = FORENSIC_USER_MESSAGE
         if extra_context and extra_context.strip():
             forensic_message += f"\n\nAdditional Context:\n{extra_context}"
@@ -469,7 +333,7 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
         summary = ", ".join(f"{k}={v['status']}" for k, v in saved.items() if k != "meta")
         if summary:
             log.info(f"[case {case_id}] resuming with saved progress: {summary} (mode={resume_mode})")
-        yield forensic_text, profiler_text, rag_text, final_text, S(
+        yield panels(
             f"♻️ Case {case_id}: found saved progress ({summary}) - resuming..." if summary
             else f"⏳ Case {case_id}: starting..."
         )
@@ -481,17 +345,13 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
         prefix = ""
         if sf and sf["status"] == "complete":
             forensic_text, forensic_done = sf["content"], True
-            yield forensic_text, profiler_text, rag_text, final_text, S(
-                "♻️ Forensic report restored from the database - skipping that step"
-            )
+            yield panels("♻️ Forensic report restored from the database - skipping that step")
         elif sf and sf["status"] == "partial":
             if resume_mode == "asis":
                 forensic_text, forensic_done = sf["content"], True
                 await store.save("forensic", forensic_text, "complete")
                 await store.invalidate(["rag", "education", "profiler", "final"])
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "⏭ Using the saved partial Forensic report as-is"
-                )
+                yield panels("⏭ Using the saved partial Forensic report as-is")
             else:
                 prefix = pstate.trim_partial(sf["content"])
                 forensic_text = prefix
@@ -501,23 +361,18 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
             # Anything computed from an older Forensic result is now stale.
             await store.invalidate(["rag", "education", "profiler", "final"])
             if not _port_open(FORENSIC_PORT):
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "🔧 Forensic server is down - restarting it (the model reloads on first use)..."
-                )
+                yield panels("🔧 Forensic server is down - restarting it (the model reloads on first use)...")
                 await _ensure_agent_up("Forensic")
             prompt = forensic_message
             if prefix:
                 prompt += pstate.continuation_block("forensic report", prefix)
             running = "⏳ Continuing the interrupted Forensic report..." if prefix else "⏳ Running Forensic agent..."
-            yield forensic_text, profiler_text, rag_text, final_text, S(running)
+            yield panels(running)
             async for forensic_text in pstate.checkpointed(
                 step_forensic_stream(image_urls, prompt), store, "forensic", prefix=prefix
             ):
-                yield forensic_text, profiler_text, rag_text, final_text, S(running)
-        forensic_data = forensic_text
-        yield forensic_text, profiler_text, rag_text, final_text, S(
-            "⏳ Forensic agent complete - running Profiler agent and reference summaries concurrently..."
-        )
+                yield panels(running)
+        yield panels("⏳ Forensic agent complete - running Profiler agent and reference summaries concurrently...")
 
         # 2) RAG and the Profiler run AT THE SAME TIME off the finished Forensic report.
         #    Saved RAG/Profiler results are only reused if the Forensic report they were
@@ -531,7 +386,7 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                 await store.save("profiler_failed", sp["content"], "partial")
                 await store.invalidate(["profiler", "final"])
                 sp = None
-                yield forensic_text, profiler_text, rag_text, final_text, S(
+                yield panels(
                     f"♻️ Saved Profiler result was invalid ({bad}) - discarded; "
                     "re-running only the Profiler (Forensic, RAG and summary are reused)..."
                 )
@@ -544,11 +399,11 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                 data = None
                 if saved_rag and saved_rag["status"] == "complete":
                     try:
-                        data = pstate.loads(saved_rag["content"])
+                        data = json.loads(saved_rag["content"])
                     except ValueError:
                         pass
                 if data is None:
-                    data = await step_forensic_rag(task_id, forensic_data)
+                    data = await step_forensic_rag(case_id, forensic_text)
                     await store.save("rag", pstate.dumps(data), "complete")
             except asyncio.CancelledError:
                 rag_future.cancel()
@@ -572,7 +427,7 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                         and "## Reference Summary" in saved_edu["content"]):
                     yield saved_edu["content"]
                     return
-                section = octen_rag.extract_evidence_of_trauma_section(forensic_data)
+                section = octen_rag.extract_evidence_of_trauma_section(forensic_text)
                 rag = {"triggered": True, "query": section or ""}
                 sources = (
                     octen_rag.select_trauma_sources(section)
@@ -600,9 +455,6 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                 log.warning(f"[EDU] Reference summaries skipped: {e}")
                 yield f"## Reference Summary\n\n_Summary unavailable: {e}_"
 
-        def _rag_panel() -> str:
-            return edu_text or rag_text
-
         async def _saved_text(t: str):
             yield t
 
@@ -619,96 +471,77 @@ async def run_pipeline_async(image_urls: list[str], extra_context: str, case_id:
                 profiler_text = p_prefix
         if profiler_source is None:
             if not _port_open(PROFILER_PORT):
-                yield forensic_text, profiler_text, rag_text, final_text, S(
-                    "🔧 Profiler server is down - restarting it (the model reloads on first use)..."
-                )
+                yield panels("🔧 Profiler server is down - restarting it (the model reloads on first use)...")
                 await _ensure_agent_up("Profiler")
             cont = pstate.continuation_block("behavioral profile", p_prefix) if p_prefix else None
             profiler_source = quarantine_bad_profiler(
                 pstate.checkpointed(
-                    guard_profiler_output(
-                        step_profiler_stream(image_urls, forensic_data, None, continuation=cont)
-                    ),
+                    guard_profiler_output(step_profiler_stream(image_urls, forensic_text, cont)),
                     store, "profiler", prefix=p_prefix,
                 ),
                 store,
             )
 
         rag_text = "_Checking the Forensic report's Evidence of Trauma section..._"
-        rag_task_gen = _one_shot_stream(_rag_step())
-        rag_data: dict = {"triggered": False}
         async with aclosing(_run_concurrently(
-            {"rag": rag_task_gen, "profiler": profiler_source, "edu": _edu_step()}
+            {"rag": _one_shot_stream(_rag_step()), "profiler": profiler_source, "edu": _edu_step()}
         )) as stream:
             async for latest, errors in stream:
                 if errors:
                     raise RuntimeError(
                         "; ".join(f"{k} step: {e}" for k, e in errors.items())
                     )
-                if latest["rag"] != "":
-                    rag_data = latest["rag"]
-                    if not rag_data["triggered"]:
-                        rag_text = "_No evidence of trauma reported in the Forensic report - no reference summaries._"
+                if latest["rag"] != "" and not latest["rag"]["triggered"]:
+                    rag_text = "_No evidence of trauma reported in the Forensic report - no reference summaries._"
                 if latest["profiler"] != "":
                     profiler_text = latest["profiler"]
                 if latest["edu"] != "":
                     edu_text = latest["edu"]
-                yield forensic_text, profiler_text, _rag_panel(), final_text, S(
-                    "⏳ Running Profiler agent and reference summaries concurrently..."
-                )
-        profiler_data = profiler_text
-        yield forensic_text, profiler_text, _rag_panel(), final_text, S("⏳ Finalizing report...")
+                yield panels("⏳ Running Profiler agent and reference summaries concurrently...")
+        yield panels("⏳ Finalizing report...")
 
-        log.info(f"Combining Forensic + reference summaries + Profiler results into final profiling report (task_id={task_id})")
+        log.info(f"Combining Forensic + reference summaries + Profiler results into final profiling report (task_id={case_id})")
         sections = [
-            f"# Case {task_id}",
-            f"## Forensic Analysis\n\n{forensic_data}",
+            f"# Case {case_id}",
+            f"## Forensic Analysis\n\n{forensic_text}",
         ]
         if edu_text:
             sections.append(edu_text)     # one "## Reference Summary - <Trauma>" section per trauma type
-        sections.append(f"## Profiler Analysis\n\n{profiler_data}")
+        sections.append(f"## Profiler Analysis\n\n{profiler_text}")
         final_markdown = "\n\n".join(sections) + "\n"
 
         Path("pipeline_result.md").write_text(final_markdown)
         await store.save("final", final_markdown, "complete")
 
-        yield forensic_text, profiler_text, _rag_panel(), final_markdown, S("✅ Pipeline completed successfully!")
+        yield panels("✅ Pipeline completed successfully!", final_markdown)
     except Exception as e:
-        # Keep every panel's text (the old code overwrote ALL panels with the error,
-        # wiping a finished Forensic report). Progress is already in Postgres.
+        # Keep every panel's text rather than wiping a finished Forensic report.
+        # Progress is already in Postgres.
         await asyncio.sleep(0.3)   # cancelled tasks (e.g. a Profiler stopped by a RAG error) finish flushing their partial output
         hint = (
             f" - progress is saved as case {case_id}; press ▶ Run Pipeline again "
             f"(resume mode) to continue from where it stopped."
             if store.ok else " - the database is unavailable, so this progress was NOT saved."
         )
-        yield forensic_text, profiler_text, rag_text, final_text, f"❌ {e}{hint}"
+        yield forensic_text, profiler_text, rag_text, "", f"❌ {e}{hint}"
 
 
 async def _one_shot_stream(coro):
-    """Wrap a plain coroutine as a single-item async generator, so a
-    one-shot awaitable (like the RAG step) can be fanned in alongside a
-    real multi-chunk stream (like the Profiler agent) via
-    `_run_concurrently`."""
+    """Wrap a coroutine as a single-item async generator so `_run_concurrently` can fan it
+    in alongside real multi-chunk streams."""
     yield await coro
 
 
 async def _run_concurrently(gens: dict):
     """
-    Fan-in helper: runs several async generators at once and yields
-    (latest, errors) as soon as ANY of them produces a new value, so the
-    UI can update whichever panel just changed without waiting on the
-    others.
+    Run several async generators at once and yield (latest, errors) whenever ANY of them
+    produces a value, so the UI can update whichever panel just changed.
 
-    `gens` maps a short key (e.g. "profiler") to an async generator.
-    `latest[key]` starts as `""` and is replaced with whatever that
-    generator yields (a growing string for a real stream, or a single
-    dict for a one-shot step wrapped via `_one_shot_stream`) — callers
-    distinguish "not yet available" from "available" by checking for
-    that initial `""` sentinel. Stops once every generator is exhausted;
-    if any raises, its exception is reported via `errors` on the same
-    yield instead of propagating immediately, so the caller can decide
-    whether to keep going or abort.
+    `latest[key]` starts as "" and is replaced by whatever that generator yields (a growing
+    string for a stream, a dict for a one-shot step); callers tell "not yet available" by
+    that "" sentinel. Stops when every generator is exhausted. A generator's exception is
+    reported via `errors` on the next yield instead of propagating, so the caller decides
+    whether to abort.
     """
     queue: asyncio.Queue = asyncio.Queue()
     latest: dict = {k: "" for k in gens}
@@ -765,7 +598,7 @@ async def run_pipeline(images, image_url, extra_context, resume_mode="continue",
             return
         case_id = saved_case
     else:
-        # Prioritize uploaded images over URL; combine if both given.
+        # Uploaded images and an image URL can be combined.
         if images:
             if len(images) > MAX_IMAGES:
                 yield tuple([f"❌ Too many images ({len(images)}). Max is {MAX_IMAGES}."] * 5)
@@ -794,91 +627,18 @@ async def run_pipeline(images, image_url, extra_context, resume_mode="continue",
         yield tuple([error] * 5)
 
 
-async def delete_selected_case_ui(confirm, case_id):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    if not case_id:
-        return "⚠️ Pick a saved case in the dropdown above first.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.forget_case(str(case_id)))
-    msg = (f"🗑 Deleted case {case_id} ({res} saved step(s))." if res else f"Nothing was saved under case {case_id}.") if ok \
-        else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-async def delete_old_cases_ui(confirm, days):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    try:
-        days = int(days)
-        if days < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        return "⚠️ Enter a whole number of days (1 or more).", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.delete_cases_older_than(days))
-    msg = f"🧹 Deleted {res} case(s) with no activity in the last {days} day(s)." if ok \
-        else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-async def delete_all_cases_ui(confirm):
-    if not confirm:
-        return "⚠️ Tick the confirmation box first - nothing was deleted.", await list_cases_for_ui(), gr.Checkbox(value=False)
-    ok, res = await pstate.run_safe(pstate.db.delete_all_cases())
-    msg = f"🗑 Deleted all {res} saved case(s)." if ok else f"❌ Database unavailable - nothing deleted: {res}"
-    log.info(f"[memory] {msg}")
-    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
-
-
-def refresh_examples():
-    """Thumbnails of photos uploaded before (temp_uploads/), newest first, duplicates removed.
-    Set SHOW_UPLOAD_EXAMPLES=0 to hide them (they are real case photos)."""
-    if os.getenv("SHOW_UPLOAD_EXAMPLES", "1") == "0":
-        return [], []
-    items = example_images.list_example_images(TEMP_IMAGE_DIR, limit=24)
-    return [(it["path"], it["name"]) for it in items], [it["path"] for it in items]
-
-
-def add_example(current_files, example_list, evt: gr.SelectData):
-    """Clicking a thumbnail adds that photo to the upload box (never twice, never beyond MAX_IMAGES)."""
-    files = example_images.normalize_paths(current_files)
-    try:
-        chosen = (example_list or [])[int(evt.index)]
-    except (TypeError, ValueError, IndexError):
-        return files or None
-    return example_images.add_unique(files, [chosen], MAX_IMAGES, warn=gr.Warning) or None
-
-
-def add_all_examples(current_files, example_list):
-    files = example_images.normalize_paths(current_files)
-    return example_images.add_unique(files, list(example_list or []), MAX_IMAGES, warn=gr.Warning) or None
-
-
-async def list_cases_for_ui():
-    rows = await pstate.list_cases_safe()
-    return gr.Dropdown(choices=[(pstate.describe_case(r), r["case_id"]) for r in rows], value=None)
-
+# =============================================
+# Agent steps (each streams the ACCUMULATED text so far)
+# =============================================
 
 async def step_forensic_stream(image_urls: list[str], prompt: str):
-    """
-    Stream the Forensic agent's markdown report as it's generated, via
-    fasta2a==2.0.1's `message/stream` SSE endpoint (A2AClient.stream_task).
-
-    Yields the ACCUMULATED text so far on every delta (not just the new
-    piece), since that's what the Gradio Markdown box needs to redraw
-    each update — callers that want just the tail should diff against
-    the previous yield themselves.
-    """
+    """Stream the Forensic agent's markdown report via the A2A `message/stream` endpoint."""
     log.info(f"[1/4] Streaming {len(image_urls)} image(s) to Forensic agent")
-    image_parts = [
-        ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
-    ]
     start = time.monotonic()
     text = ""
     try:
         async for delta in FORENSIC_AGENT.stream_task(
-            A2AMessage(parts=[TextPart(prompt), *image_parts])
+            A2AMessage(parts=[TextPart(prompt), *_image_parts(image_urls)])
         ):
             text += delta
             yield text
@@ -892,54 +652,39 @@ async def step_forensic_stream(image_urls: list[str], prompt: str):
         raise RuntimeError("Forensic agent returned an empty result")
 
 
-async def step_forensic_rag(task_id: str, forensic_report: str) -> dict:
+async def step_forensic_rag(case_id: str, forensic_report: str) -> dict:
     """
-    Check the Forensic agent's report for evidence of trauma and, if
-    found, run the Octen/FAISS RAG pipeline against forensic_knowledge/
-    to fetch grounding reference material.
-
-    This is where the "RAG pipeline starts up" trigger lives: the Forensic
-    agent is deliberately tool-less (see forensic_agent.py), so this check
-    happens here in the orchestrator, right after its report comes back
-    and before it's forwarded to the Profiler agent.
-
-    The trigger itself is just reading the report's own mandatory
-    "## Evidence of Trauma" section (Yes/No) — see
-    octen_rag.check_trauma_and_retrieve for the fallback keyword scan
-    used only if that section is missing.
-
-    Returns the dict shape from octen_rag.check_trauma_and_retrieve:
-        {triggered, source, matched_keywords, query, results, corpus_size}
+    Check the Forensic report's "Evidence of Trauma" section and, if it says Yes, run the
+    Octen/FAISS retrieval over forensic_knowledge/. The Forensic agent is deliberately
+    tool-less, so this check lives here in the orchestrator (see
+    octen_rag.check_trauma_and_retrieve for the result shape and the keyword fallback).
     """
-    log.info(f"[RAG] Reading Forensic report's 'Evidence of Trauma' section (task_id={task_id})")
-    # Embedding + FAISS calls are blocking (sentence-transformers), so run
-    # off the event loop rather than stalling the async pipeline.
+    log.info(f"[RAG] Reading Forensic report's 'Evidence of Trauma' section (task_id={case_id})")
+    # Embedding + FAISS calls block, so run them off the event loop.
     rag_data = await asyncio.to_thread(octen_rag.check_trauma_and_retrieve, forensic_report)
 
     if rag_data["triggered"]:
         log.info(
             f"[RAG] Triggered via {rag_data['source']} -> "
             f"fetched {len(rag_data['results'])} chunk(s) from forensic_knowledge/ "
-            f"(corpus_size={rag_data['corpus_size']}, task_id={task_id})"
+            f"(corpus_size={rag_data['corpus_size']}, task_id={case_id})"
         )
     else:
-        log.info(f"[RAG] No evidence of trauma reported — RAG pipeline not triggered (task_id={task_id})")
+        log.info(f"[RAG] No evidence of trauma reported — RAG pipeline not triggered (task_id={case_id})")
 
     return rag_data
 
 
-# Optional safety cap on how much of the selected reference file is sent to the
-# Forensic agent (characters). 0 = send the COMPLETE file. Gunshot_wounds.md is
-# ~119k chars (~30k tokens); set e.g. RAG_FULL_FILE_MAX_CHARS=60000 if the model
-# runs out of memory/context on it.
+# Optional cap on how much of a reference file is sent to the Forensic agent (characters).
+# 0 = send the COMPLETE file. Gunshot_wounds.md is ~119k chars (~30k tokens); set e.g.
+# RAG_FULL_FILE_MAX_CHARS=60000 if the model runs out of memory/context on it.
 RAG_FULL_FILE_MAX_CHARS = int(os.getenv("RAG_FULL_FILE_MAX_CHARS", "0"))
 
 
 def education_sources(rag_data: dict) -> list[str]:
-    """The forensic_knowledge/*.md files chosen for the educational summary:
-    ONE per distinct trauma type in the report. If no trauma type was
-    recognised (or the case was saved before this existed), falls back to the
-    single best similarity match. [] if RAG didn't trigger."""
+    """The forensic_knowledge/*.md files for the reference summaries: ONE per distinct
+    trauma type in the report. If no type was recognised (or the case was saved before
+    this existed), the single best similarity match. [] if RAG didn't trigger."""
     if not rag_data.get("triggered"):
         return []
     sources = [
@@ -956,14 +701,6 @@ def education_sources(rag_data: dict) -> list[str]:
 
 def education_title(source: str) -> str:
     return Path(source).stem.replace("_", " ").replace("-", " ").strip().title()
-
-
-def education_heading(sources: list[str]) -> str:
-    """e.g. "Gunshot Wounds + Asphyxiation (full files)"."""
-    if not sources:
-        return "Reference file"
-    names = " + ".join(education_title(s) for s in sources)
-    return f"{names} (full file{'s' if len(sources) > 1 else ''})"
 
 
 def build_education_prompt(rag_data: dict, source: str, file_text: str, n_files: int = 1) -> str:
@@ -1000,12 +737,9 @@ def build_education_prompt(rag_data: dict, source: str, file_text: str, n_files:
 
 async def step_forensic_education_stream(rag_data: dict, source: str, n_files: int = 1):
     """
-    After the Forensic report is finished and RAG has triggered, load the
-    COMPLETE text of the single best-matching forensic_knowledge/*.md file
-    into the (now idle) Forensic agent and stream back its educational summary
-    of what that file says about the reported trauma. Text-only: no images.
-
-    Yields the accumulated text so far, like step_forensic_stream.
+    Load the COMPLETE text of one forensic_knowledge/*.md file into the (now idle)
+    Forensic agent and stream back its educational summary of what that file says about
+    the reported trauma. Text-only: no images.
     """
     file_text = await asyncio.to_thread(octen_rag.load_full_source_text, source)
     if not file_text or not file_text.strip():
@@ -1030,10 +764,9 @@ async def step_forensic_education_stream(rag_data: dict, source: str, n_files: i
 
 
 async def step_forensic_education_multi_stream(rag_data: dict, sources: list[str]):
-    """One educational summary per trauma file, run one after another (each file
-    is loaded in full on its own, so the prompt never holds more than one file).
-    Yields the combined text so far; every file gets its own
-    "## Reference Summary - <Trauma>" section."""
+    """One educational summary per trauma file, one after another (the prompt never holds
+    more than one file). Yields the combined text so far, one
+    "## Reference Summary - <Trauma>" section per file."""
     done = ""
     for source in sources:
         header = f"## Reference Summary - {education_title(source)}\n\n"
@@ -1044,106 +777,18 @@ async def step_forensic_education_multi_stream(rag_data: dict, sources: list[str
         done += header + text + "\n\n"
 
 
-_SENTENCE_END_RE = re.compile(r'[.!?"\')\]]\s*$')
-_SENTENCE_START_RE = re.compile(r'^[A-Z0-9"\'(#]')
-
-
-def _mark_excerpt_boundaries(text: str) -> str:
-    """
-    Prefix/suffix a chunk with an ellipsis if it doesn't land on a
-    clean sentence boundary, so a genuine mid-sentence excerpt reads
-    as "this continues before/after" rather than looking like the
-    text randomly stops. RecursiveCharacterTextSplitter now prefers
-    sentence-ending separators (see octen_rag.py) so this should be
-    the exception rather than the rule, but long technical sentences
-    can still occasionally exceed chunk_size.
-    """
-    text = text.strip()
-    if not text:
-        return text
-    if not _SENTENCE_START_RE.match(text):
-        text = "…" + text
-    if not _SENTENCE_END_RE.search(text):
-        text = text + "…"
-    return text
-
-
-def format_rag_section(rag_data: dict) -> str:
-    """
-    Render RAG grounding results as clean Markdown, grouped by source
-    file and — within each file — restored to the reference material's
-    own original order rather than left in FAISS's raw similarity-score
-    order.
-
-    Score order is right for RANKING which chunks to keep, but wrong
-    for READING them: top_k=5 chunks can come from several different
-    forensic_knowledge/*.md files and land in an arbitrary interleaved
-    order (e.g. a gunshot-wounds passage, then an asphyxia passage,
-    then back to gunshot-wounds), which reads as disjointed even though
-    each individual chunk is a legitimate match. Grouping by source
-    (each group heading ordered by that source's best-scoring chunk,
-    so the most relevant topic still leads) and sorting each group's
-    chunks by their original position in the file fixes that, without
-    losing the relevance ranking that got them retrieved in the first
-    place.
-    """
-    if not rag_data["triggered"]:
-        return "_Not triggered — Forensic report's 'Evidence of Trauma' section said No._"
-
-    by_source: dict[str, list[dict]] = {}
-    source_order: list[str] = []
-    for r in rag_data["results"]:
-        if not r.get("text", "").strip():
-            continue
-        source = r.get("source", "unknown")
-        if source not in by_source:
-            by_source[source] = []
-            source_order.append(source)  # first appearance = best score for this source
-        by_source[source].append(r)
-
-    if not source_order:
-        return "_No matching reference material found._"
-
-    sections = []
-    for source in source_order:
-        chunks = sorted(by_source[source], key=lambda r: r.get("chunk_index", 0))
-        title = Path(source).stem.replace("_", " ").replace("-", " ").strip().title()
-        body = "\n\n".join(_mark_excerpt_boundaries(c["text"]) for c in chunks)
-        sections.append(f"### {title}\n*(source: {source})*\n\n{body}")
-
-    return "\n\n---\n\n".join(sections)
-
-
-async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_data: dict | None = None, continuation: str | None = None):
-    """
-    Forward the Forensic agent's result (+ original images, + any RAG
-    grounding) to the Profiler agent, streaming its markdown report as
-    it's generated (same genuine SSE mechanism as `step_forensic_stream`
-    — see that docstring for how thinking tokens and tool-call protocol
-    text are kept out of what's yielded here).
-    """
+async def step_profiler_stream(image_urls: list[str], forensic_report: str, continuation: str | None = None):
+    """Forward the Forensic report (+ the original images) to the Profiler agent and
+    stream its markdown report, like `step_forensic_stream`."""
     log.info(f"[3/4] Streaming {len(image_urls)} image(s) + Forensic result to Profiler agent")
     combined_prompt = f"Forensic agent report (from A2A):\n{forensic_report}"
-    if rag_data and rag_data.get("triggered"):
-        trigger_desc = (
-            "its Evidence of Trauma section" if rag_data.get("source") == "evidence_of_trauma_section"
-            else f"keyword fallback match: {', '.join(rag_data['matched_keywords'])}"
-        )
-        combined_prompt += (
-            f"\n\nGrounded reference material (from forensic_knowledge/, retrieved because "
-            f"the Forensic report's {trigger_desc}):\n"
-            f"{format_rag_section(rag_data)}"
-        )
     if continuation:
         combined_prompt += continuation
-    image_parts = [
-        ImagePart(url=url, media_type=guess_image_media_type(url)) for url in image_urls
-    ]
     start = time.monotonic()
     text = ""
     try:
         async for delta in PROFILER_AGENT.stream_task(
-            A2AMessage(parts=[TextPart(combined_prompt), *image_parts])
+            A2AMessage(parts=[TextPart(combined_prompt), *_image_parts(image_urls)])
         ):
             text += delta
             yield text
@@ -1156,6 +801,7 @@ async def step_profiler_stream(image_urls: list[str], forensic_report: str, rag_
     if not text:
         raise RuntimeError("Profiler agent returned an empty result")
 
+
 class BadProfilerOutput(RuntimeError):
     """The Profiler 'finished' but what it produced is not a report."""
     def __init__(self, text: str, reason: str):
@@ -1165,10 +811,9 @@ class BadProfilerOutput(RuntimeError):
 
 def profiler_output_problem(text: str) -> str | None:
     """
-    Why `text` is NOT a valid Profiler report, or None if it looks fine.
-    Catches the Profiler's final answer being a raw tool call (e.g.
-    {"name": "read_file", "arguments": {...}}, bare or in <tool_call> tags or a
-    code fence) and model_utils' "_⚠️ ..." generation-failure placeholders.
+    Why `text` is NOT a valid Profiler report, or None if it looks fine. Catches a final
+    answer that is a raw tool call (bare, in <tool_call> tags, or in a code fence) and
+    model_utils' "_⚠️ ..." generation-failure placeholders.
     """
     t = (text or "").strip()
     if not t:
@@ -1191,9 +836,8 @@ def profiler_output_problem(text: str) -> str | None:
 
 
 async def guard_profiler_output(gen):
-    """Pass the Profiler's stream through, then - BEFORE the checkpoint wrapper
-    can mark the step complete - raise BadProfilerOutput if the finished text
-    isn't a real report."""
+    """Pass the Profiler's stream through, then - BEFORE the checkpoint wrapper can mark the
+    step complete - raise BadProfilerOutput if the finished text isn't a real report."""
     last = ""
     async with aclosing(gen) as g:
         async for text in g:
@@ -1205,10 +849,10 @@ async def guard_profiler_output(gen):
 
 
 async def quarantine_bad_profiler(gen, store):
-    """Outermost wrapper: on BadProfilerOutput, keep the bad text for debugging
-    under the step name 'profiler_failed', discard the saved 'profiler' (and
-    'final') so a re-run regenerates ONLY the Profiler, and surface an error.
-    Forensic, RAG and education results stay saved and are reused."""
+    """Outermost wrapper: on BadProfilerOutput, keep the bad text for debugging under the
+    step 'profiler_failed', discard the saved 'profiler' (and 'final') so a re-run
+    regenerates ONLY the Profiler, and surface an error. Forensic, RAG and education
+    results stay saved and are reused."""
     try:
         async with aclosing(gen) as g:
             async for text in g:
@@ -1217,6 +861,84 @@ async def quarantine_bad_profiler(gen, store):
         await store.save("profiler_failed", e.text, "partial")
         await store.invalidate(["profiler", "final"])
         raise RuntimeError(f"Profiler output was invalid ({e}) and was discarded") from e
+
+
+# =============================================
+# UI handlers
+# =============================================
+
+async def list_cases_for_ui():
+    rows = await pstate.list_cases_safe()
+    return gr.Dropdown(choices=[(pstate.describe_case(r), r["case_id"]) for r in rows], value=None)
+
+
+async def _delete_reply(msg: str):
+    """Standard reply of the delete buttons: status text, refreshed case list, cleared confirm box."""
+    return msg, await list_cases_for_ui(), gr.Checkbox(value=False)
+
+
+_NOT_CONFIRMED = "⚠️ Tick the confirmation box first - nothing was deleted."
+
+
+async def delete_selected_case_ui(confirm, case_id):
+    if not confirm:
+        return await _delete_reply(_NOT_CONFIRMED)
+    if not case_id:
+        return await _delete_reply("⚠️ Pick a saved case in the dropdown above first.")
+    ok, res = await pstate.run_safe(pstate.db.forget_case(str(case_id)))
+    msg = (f"🗑 Deleted case {case_id} ({res} saved step(s))." if res else f"Nothing was saved under case {case_id}.") if ok \
+        else f"❌ Database unavailable - nothing deleted: {res}"
+    log.info(f"[memory] {msg}")
+    return await _delete_reply(msg)
+
+
+async def delete_old_cases_ui(confirm, days):
+    if not confirm:
+        return await _delete_reply(_NOT_CONFIRMED)
+    try:
+        days = int(days)
+        if days < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return await _delete_reply("⚠️ Enter a whole number of days (1 or more).")
+    ok, res = await pstate.run_safe(pstate.db.delete_cases_older_than(days))
+    msg = f"🧹 Deleted {res} case(s) with no activity in the last {days} day(s)." if ok \
+        else f"❌ Database unavailable - nothing deleted: {res}"
+    log.info(f"[memory] {msg}")
+    return await _delete_reply(msg)
+
+
+async def delete_all_cases_ui(confirm):
+    if not confirm:
+        return await _delete_reply(_NOT_CONFIRMED)
+    ok, res = await pstate.run_safe(pstate.db.delete_all_cases())
+    msg = f"🗑 Deleted all {res} saved case(s)." if ok else f"❌ Database unavailable - nothing deleted: {res}"
+    log.info(f"[memory] {msg}")
+    return await _delete_reply(msg)
+
+
+def refresh_examples():
+    """Thumbnails of photos uploaded before (temp_uploads/), newest first, duplicates removed.
+    Set SHOW_UPLOAD_EXAMPLES=0 to hide them (they are real case photos)."""
+    if os.getenv("SHOW_UPLOAD_EXAMPLES", "1") == "0":
+        return [], []
+    items = example_images.list_example_images(TEMP_IMAGE_DIR, limit=24)
+    return [(it["path"], it["name"]) for it in items], [it["path"] for it in items]
+
+
+def add_example(current_files, example_list, evt: gr.SelectData):
+    """Clicking a thumbnail adds that photo to the upload box (never twice, never beyond MAX_IMAGES)."""
+    files = example_images.normalize_paths(current_files)
+    try:
+        chosen = (example_list or [])[int(evt.index)]
+    except (TypeError, ValueError, IndexError):
+        return files or None
+    return example_images.add_unique(files, [chosen], MAX_IMAGES, warn=gr.Warning) or None
+
+
+def add_all_examples(current_files, example_list):
+    files = example_images.normalize_paths(current_files)
+    return example_images.add_unique(files, list(example_list or []), MAX_IMAGES, warn=gr.Warning) or None
 
 
 # =============================================

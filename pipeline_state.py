@@ -35,7 +35,6 @@ log = logging.getLogger("pipeline_state")
 
 _GRADIO_FILE_MARK = "gradio_api/file="
 _STORE_TIMEOUT_S = 20.0
-_PUBLISHED_STEPS = ("forensic", "profiler", "final")   # also mirrored into agent_results (MCP get_result)
 
 
 # ───────────────────────── case identity ─────────────────────────
@@ -82,10 +81,6 @@ def meta_json(image_urls: list[str], extra_context: str) -> str:
 
 def dumps(obj: Any) -> str:
     return json.dumps(obj, default=str)
-
-
-def loads(text: str) -> Any:
-    return json.loads(text)
 
 
 # ───────────────────── continuing partial output ─────────────────────
@@ -158,12 +153,10 @@ class CaseStore:
         return await self._run(db.load_steps(self.case_id), default={}) or {}
 
     async def delete_all(self) -> None:
-        await self._run(db.delete_case(self.case_id))
+        await self._run(db.forget_case(self.case_id))
 
     async def save(self, step: str, content: str, status: str) -> None:
-        wrote = await self._run(db.save_step(self.case_id, step, content, status), default=False)
-        if wrote and status == "complete" and step in _PUBLISHED_STEPS:
-            await self._run(db.store_result(self.case_id, step, content))   # visible to MCP get_result
+        await self._run(db.save_step(self.case_id, step, content, status))
 
     async def invalidate(self, steps: list[str]) -> None:
         """Forget downstream steps that were computed from an older upstream result."""
