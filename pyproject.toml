@@ -1,51 +1,40 @@
 [project]
 name = "a-s-p"
 version = "0.1.0"
-description = "Add your description here"
+description = "Two-agent forensic analysis and behavioral profiling pipeline: Gradio UI, A2A agent servers, Postgres checkpoints"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # ── app / servers ──
     "asyncpg>=0.30.0",
-    "datasets>=4.0,<4.8.6",
-    # Pinned (not just floored) on purpose: the client in
-    # A2A_image_delegation_client.py is hand-written against this
-    # exact wire format. This went back and forth once already (see
-    # that file's module docstring for the full evidence trail) —
-    # 2.0.1 is now confirmed correct via multiple independent direct
-    # checks against this repo's actual installed .venv, not just
-    # inferred from a lockfile or an isolated test install elsewhere.
-    # If you deliberately upgrade this, you MUST regenerate uv.lock
-    # (`uv lock --upgrade-package fasta2a && uv sync`) AND re-verify
-    # A2A_image_delegation_client.py against the NEW version's actual
-    # installed fasta2a/schema.py + a real a2a_request_ta.validate_json()
-    # round trip — do not trust inference from source reading alone,
-    # and do not trust what a lockfile claims without confirming via
-    # `importlib.metadata.version('fasta2a')` in the real target .venv.
+    # Pinned (not just floored) on purpose: a2a_client.py is hand-written against this exact
+    # wire format. If you deliberately upgrade it, regenerate uv.lock AND re-verify the client
+    # against the new version's schema (see a2a_client.py's docstring).
     "fasta2a[pydantic-ai]==2.0.1",
     "fastmcp>=4.0.3",
     "gradio>=6.19.0",
     "httpx>=0.28.1",
-    "httpx-sse>=0.4.3",
-    "jinja2>=3.1.6",
-    "langchain-core>=1.0.0",
-    "langchain-text-splitters>=1.0.0",
-    "langchain-community>=0.4.0",
-    "langchain-huggingface>=0.3.0",
-    "faiss-cpu>=1.9.0",
-    "sentence-transformers>=3.0.0",
-    "numpy>=2.4.3",
-    "packaging>=26.2",
-    "pandas>=3.0.1",
-    "protobuf>=7.34.1",
-    "pyarrow>=25.0.1",
-    "pydantic>=2.13.4",
     "pydantic-ai-slim>=2.42.0",
-    "scikit-learn>=1.9.0",
-    "sse-starlette>=3.4.2",
-    "starlette>=1.0.0",
+    "python-dotenv>=1.2.2",
+    "uvicorn>=0.46.0",
+    # ── RAG ──
+    "faiss-cpu>=1.9.0",
+    "langchain-community>=0.4.0",
+    "langchain-core>=1.0.0",
+    "langchain-huggingface>=0.3.0",
+    "langchain-text-splitters>=1.0.0",
+    "sentence-transformers>=3.0.0",
+    # ── local model inference (qwen_agents/model_utils.py) ──
     "torch>=2.12.1",
     "transformers>=5.1.0,<=5.5.0",
-    "unsloth>=2026.9.1",
-    "uvicorn>=0.46.0",
-    "gh>=0.0.4",
+    "huggingface-hub>=1.20.1",
+    # Needed at runtime but only ever installed transitively before:
+    #   accelerate     - device_map="cuda" loading
+    #   peft           - adapter-only model repos
+    #   bitsandbytes   - the optional *_LOAD_IN_4BIT mode
+    #   torchvision    - transformers' Qwen3-VL video/image processors require it
+    "accelerate>=1.15.0",
+    "peft>=0.20.0",
+    "bitsandbytes>=0.50.2",
+    "torchvision>=0.27.1",
 ]
