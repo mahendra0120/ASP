@@ -14,18 +14,14 @@ wheels/
 .ipynb_checkpoints/
 
 # Runtime-generated artifacts (created by running main.py)
-a2a_debug.log
-pipeline_result.json
 pipeline_result.md
+.octen_faiss_index/
 
 temp_uploads/
 
 # Per-service subprocess logs (created by main.py's launch_servers())
 server_logs/
 
-# Local Hugging Face model cache (see model_utils.py's HF_HOME
-# requirement) — this holds multi-GB model checkpoints and must never
-# be committed. Point HF_HOME at a folder like this to skip
-# re-downloading weights on every run; set HF_HUB_OFFLINE=1 too once
-# it's populated to skip the network freshness check entirely.
+# Local Hugging Face model cache: multi-GB checkpoints, never commit.
+# Point HF_HOME at a folder like this; set HF_HUB_OFFLINE=1 once it's populated.
 hf_cache/

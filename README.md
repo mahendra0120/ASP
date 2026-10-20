@@ -34,7 +34,7 @@ idempotent and does, in order:
 | 1 | `setup_env.sh` | Installs Node/`npx` + `uv` if missing, points the HF / uv / npm caches at `/workspace`, pre-installs the MCP filesystem server, exports the env vars |
 | 2 | `setup_postgres.sh` | Installs/starts Postgres, creates the `asp` role + DB, restores the latest backup, starts the background backup loop |
 | 3 | `uv sync --frozen` | Installs Python deps (fast after the first run — cached on the volume) |
-| 4 | `main.py` | Launches the MCP + Profiler + Forensic servers and the Gradio UI |
+| 4 | `main.py` | Starts the Gradio UI. Press **🚀 Start Servers** in it to launch the Profiler and Forensic agent servers (`a2a_server.py`) |
 
 **Environment variables** (set by `setup_env.sh`)
 
@@ -50,10 +50,11 @@ never in a script or committed file. It's only needed for the first
 download of a private/gated repo; once weights are cached the app runs
 offline and the token isn't used.
 
-**Logs** — `server_logs/{mcp,profiler,forensic}_server.log`. They are
-deleted and recreated on every launch, so they only ever contain the
-current run. If the Profiler fails, its traceback is in
-`profiler_server.log`.
+**Logs** — `server_logs/{profiler,forensic}_server.log`. Each launch
+starts a fresh log and keeps the previous one as `*.log.prev`, so a
+crash trace survives a restart. If the Profiler fails, its traceback
+is in `profiler_server.log`; `exit_codes.log` records how each server
+process exited (e.g. SIGKILL from the OOM killer).
 
 **Database backups** — a snapshot is written to
 `/workspace/pg-backups/latest.dump` every 5 minutes. Run
@@ -62,3 +63,16 @@ stopping the pod.
 
 `setup_env.sh` must be **sourced** (`source setup_env.sh`), not
 executed, if you run it by hand; `start.sh` does that for you.
+
+## Project layout
+
+| Path | Role |
+|---|---|
+| `main.py` | Gradio UI + pipeline orchestration (Forensic → RAG ‖ Profiler), server start/stop/restart |
+| `a2a_server.py` | Serves one agent over A2A: `python a2a_server.py forensic\|profiler` |
+| `a2a_client.py` | Minimal streaming A2A client used by `main.py` |
+| `qwen_agents/` | The two agents and `model_utils.py` (local Qwen3-VL inference as a pydantic-ai model) |
+| `octen_rag.py` | Embedding retrieval + trauma-type selection over `forensic_knowledge/` |
+| `pipeline_state.py`, `db.py` | Postgres checkpointing so interrupted runs can resume |
+| `example_images.py` | Thumbnail gallery of previously uploaded photos |
+| `env_defaults.py` | Loads `.env` and sets cache/port defaults before anything imports `huggingface_hub` |

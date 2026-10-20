@@ -473,7 +473,7 @@ def make_model(
         This streams the model's generation in-process AND across the
         A2A hop: fasta2a==2.0.1's `message/stream` SSE endpoint relays
         exactly what this generator yields to a remote caller in real
-        time (see A2A_image_delegation_client.py's `stream_task`).
+        time (see a2a_client.py's `stream_task`).
 
         RELIABILITY GUARANTEE — pydantic-ai's FunctionModel raises
         `ValueError: Stream function must return at least one item`
