@@ -374,7 +374,7 @@ def extract_trigger_context(text: str, matched_keywords: list[str], window: int 
 TRAUMA_CATEGORY_FILES: dict[str, str] = {
     "gunshot":     "Gunshot_wounds.md",
     "sharp_force": "sharp_force_injury.md",
-    "asphyxia":    "asphyxiation.md",
+    "asphyxia":    "Asphyxiation.md",
     "thermal":     "Thermal_injuries.md",
     "blunt_force": "Blunt_Force_Trauma.md",
 }
