@@ -97,7 +97,7 @@ def load_corpus_documents(chunk_size: int = 800, chunk_overlap: int = 100) -> li
     return docs
 
 
-_vectorstore = None  # module-level cache; reset by clear_index_cache()
+_vectorstore = None  # in-memory cache of the loaded/built index
 
 
 def get_vectorstore():
@@ -131,12 +131,12 @@ def get_vectorstore():
 
 def clear_index_cache() -> bool:
     """
-    Delete the on-disk index cache and the in-memory store, so the next query() rebuilds
-    from the current corpus and chunking logic (a stale cache was once silently reused
-    after the chunking code changed). Returns True if a cache was removed.
+    Delete the on-disk index cache so the NEXT process to need an index rebuilds it from the
+    current corpus and chunking logic (a stale cache was once silently reused after the
+    chunking code changed). An index already loaded in this process stays in memory:
+    re-embedding the corpus on CPU takes minutes, so restarting the agent servers must not
+    force it. Returns True if a cache was removed.
     """
-    global _vectorstore
-    _vectorstore = None
     if INDEX_DIR.exists():
         shutil.rmtree(INDEX_DIR)
         return True
