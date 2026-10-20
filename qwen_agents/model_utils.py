@@ -1,42 +1,33 @@
 """
 model_utils.py
 ─────────────────────────────────────────────────────────────────
-Shared helper that wraps a local Qwen3-VL checkpoint (loaded via
-unsloth's FastVisionModel, full precision) as a pydantic-ai `Model`
-so both agents can plug it into `Agent(model=...)`.
+Wraps a local Qwen3-VL checkpoint (plain transformers, bf16; optional 4-bit) as a
+pydantic-ai `FunctionModel`, so both agents can use it as `Agent(model=make_model(...))`.
+Pure local inference: nothing here knows about MCP or A2A.
 
-This has nothing to do with MCP or A2A — it is pure local inference.
-Both forensic_agent.py and profiler_agent.py import `make_model`
-from here instead of duplicating the huggingface_hub/unsloth
-loading code.
-
-Tool calling: since this is a raw local-generation backend (not a
-hosted API with native function-calling), tool calls are implemented
-via a simple text protocol — the model is told to emit
-`<tool_call>{"name": ..., "arguments": {...}}</tool_call>` when it
-wants to invoke a tool (e.g. the Profiler agent's MCP filesystem
-`read_file`). We detect that block in the generated text, parse it,
-and return a real pydantic-ai `ToolCallPart` so the framework
-actually executes the tool and loops generation with the result.
+Tool calling: this is a raw local-generation backend with no native function calling, so
+tool calls use a text protocol. The model is told to emit
+`<tool_call>{"name": ..., "arguments": {...}}</tool_call>`; we detect that block, parse it
+and return a real `ToolCallPart`, so the framework runs the tool (e.g. the Profiler's MCP
+filesystem `read_file`) and loops generation with the result.
 """
 
 from __future__ import annotations
-try:  # apply the runtime defaults even if the caller did not
-    import env_defaults  # noqa: F401
-except ImportError:
-    pass
+
+import env_defaults  # noqa: F401  (HF_HOME / HF_HUB_OFFLINE defaults + .env; must precede huggingface_hub)
+
 import asyncio
 import json
 import logging
 import os
 import re
+import threading
 import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-from dotenv import load_dotenv
-from huggingface_hub import snapshot_download
-from transformers import AutoProcessor
+
+from huggingface_hub import login, snapshot_download
 from pydantic_ai.messages import (
     BinaryContent,
     DocumentUrl,
@@ -50,16 +41,18 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from transformers import AutoProcessor, TextIteratorStreamer
 
 log = logging.getLogger("model_utils")
 
-hf_home = os.getenv("HF_HOME") or "/workspace/hf_cache"
-os.environ["HF_HOME"] = hf_home
-
-log.info(f"Using HF_HOME: {hf_home}")
+# With HF_HUB_OFFLINE set every Hub call (including login()'s whoami check) is disabled and
+# login() would raise, so only log in when online; cached weights need no session.
+if os.getenv("HF_TOKEN"):
+    if os.getenv("HF_HUB_OFFLINE"):
+        log.info("HF_HUB_OFFLINE is set — skipping huggingface_hub login() (relying on locally cached model weights).")
+    else:
+        login(token=os.getenv("HF_TOKEN"))
 
 # Regex for detecting a tool-call block in the model's raw generated text.
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -153,21 +146,10 @@ def _load_with_transformers(local_path: str, processor_path: Optional[str], load
 
 
 @lru_cache(maxsize=4)
-def _load(model_id: str, adapter_path: Optional[str], processor_path: Optional[str], load_in_4bit: bool):
-    """Load (and cache) the model + processor for a given model_id, via unsloth.
-
-    `load_in_4bit` is part of the cache key (not just a call-time knob)
-    so a model requested once in 4-bit and once in full precision are
-    correctly treated as two distinct loads rather than silently
-    reusing whichever was loaded first.
-    """
-    local_path = _download(model_id)
-    model, processor = _load_with_transformers(local_path, processor_path, load_in_4bit)
-
-    if adapter_path:
-        model.load_adapter(adapter_path)
-
-    return model, processor
+def _load(model_id: str, processor_path: Optional[str], load_in_4bit: bool):
+    """Load (and cache) the model + processor. `load_in_4bit` is part of the cache key so a
+    4-bit and a full-precision load of the same model are two distinct loads."""
+    return _load_with_transformers(_download(model_id), processor_path, load_in_4bit)
 
 
 def _extract_chat_messages(messages: list[ModelMessage]) -> list[dict]:
@@ -380,7 +362,6 @@ def _replace_special_tokens(text: str, tokenizer) -> str:
 def make_model(
     model_id: str,
     *,
-    adapter_path: Optional[str] = None,
     processor_path: Optional[str] = None,
     temperature: float = 0.15,
     max_new_tokens: int = 6144,
@@ -388,61 +369,42 @@ def make_model(
     load_in_4bit: bool = False,
 ) -> FunctionModel:
     """
-    Build a pydantic-ai `Model` backed by a local Qwen3-VL checkpoint,
-    loaded via unsloth's FastVisionModel. Pass `load_in_4bit=True` (or
-    set the per-agent env var — see forensic_agent.py / profiler_agent.py)
-    to cut VRAM usage roughly 4x; leave False for full precision if you
-    have the VRAM headroom for both agents' models at once.
+    Build a pydantic-ai `FunctionModel` backed by a local Qwen3-VL checkpoint (everything
+    runs on-device, no network call). `load_in_4bit=True` cuts VRAM roughly 4x; leave it
+    False if both agents' models fit in full precision.
 
-    Returns a `FunctionModel` (a model driven by plain Python
-    callables) so `Agent(model=make_model(...))` works exactly like it
-    would with a hosted-API model, but everything runs on-device with
-    no network call. Both a blocking path (`_run`, used by
-    `agent.run()`) and a streaming path (`_stream_run`, used by
-    `agent.run_stream()` and by fasta2a's `message/stream` SSE
-    endpoint) are provided — see `_stream_run`'s docstring for details,
-    including its guarantee to always yield at least one item even on
-    failure (pydantic-ai otherwise raises `ValueError: Stream function
-    must return at least one item`, which used to crash the whole A2A
-    task).
+    Both a blocking path (`_run`, used by `agent.run()`) and a streaming path
+    (`_stream_run`, used by `agent.run_stream()` and fasta2a's `message/stream` endpoint)
+    are provided. Both strip the <think>...</think> block so only the final answer is
+    returned. `max_new_tokens` is generous because an agent with a large system prompt
+    (e.g. the Profiler's skill file) doing step-by-step reasoning can otherwise exhaust
+    its budget before reaching an answer; `_stream_run` logs a clear warning when that happens.
 
-    `max_new_tokens` defaults to 6144 rather than a smaller number
-    specifically because an agent with a large embedded system prompt
-    (e.g. the Profiler's full skill file) doing real step-by-step
-    `<think>` reasoning can otherwise exhaust its budget before ever
-    reaching a final answer — raise it further per-agent (see
-    profiler_agent.py) if that still happens; `_stream_run` logs a
-    clear warning naming this exact cause when it does.
-
-    Both paths strip a <think>...</think> reasoning block so only the
-    final answer is ever returned to the caller — see `_strip_thinking`.
-
-    Supports real MCP/tool execution via a simple text-based tool-call
-    protocol (see `_build_tool_instructions`/`_TOOL_CALL_RE`) — if the
-    agent has tools attached (via `toolsets=[...]`), the model is told
-    how to invoke them, and a detected tool-call is turned into a real
-    `ToolCallPart` so pydantic-ai's graph actually runs the tool and
-    loops generation with its result.
+    `reference_images` are attached to the first turn only. If the agent has tools
+    (`toolsets=[...]`), the model is told the text tool-call protocol and a detected call
+    becomes a real `ToolCallPart`.
     """
 
-    def _run(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
-        model, processor = _load(model_id, adapter_path, processor_path, load_in_4bit)
-        inputs, tokenizer = _build_chat_and_inputs(
-            model, processor, model_id, messages, agent_info, reference_images
-        )
-
-        generated_ids = model.generate(
+    def _gen_kwargs(inputs, tokenizer) -> dict:
+        return dict(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=temperature > 0,
             temperature=max(temperature, 1e-5),
             repetition_penalty=1.15,
-            # Stop generation the moment a complete tool-call block is
-            # emitted, instead of burning the rest of the token budget
-            # re-generating near-identical repeats of the same call.
+            # Stop the moment a complete tool call is emitted, instead of burning the
+            # remaining budget regenerating near-identical repeats of it.
             stop_strings=["</tool_call>"],
             tokenizer=tokenizer,
         )
+
+    def _run(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        model, processor = _load(model_id, processor_path, load_in_4bit)
+        inputs, tokenizer = _build_chat_and_inputs(
+            model, processor, model_id, messages, agent_info, reference_images
+        )
+
+        generated_ids = model.generate(**_gen_kwargs(inputs, tokenizer))
         trimmed = [
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -526,14 +488,11 @@ def make_model(
         one honest, clearly-labeled fallback message instead of
         propagating and taking the task down.
         """
-        import threading
-        from transformers import TextIteratorStreamer
-
         buffer = ""  # raw text so far (special tokens intact) — used by the fallback below too
         past_think = False
 
         try:
-            model, processor = _load(model_id, adapter_path, processor_path, load_in_4bit)
+            model, processor = _load(model_id, processor_path, load_in_4bit)
             inputs, tokenizer = _build_chat_and_inputs(
                 model, processor, model_id, messages, agent_info, reference_images
             )
@@ -541,16 +500,7 @@ def make_model(
             streamer = TextIteratorStreamer(
                 tokenizer, skip_prompt=True, skip_special_tokens=False
             )
-            gen_kwargs = dict(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=max(temperature, 1e-5),
-                repetition_penalty=1.15,
-                stop_strings=["</tool_call>"],
-                tokenizer=tokenizer,
-                streamer=streamer,
-            )
+            gen_kwargs = {**_gen_kwargs(inputs, tokenizer), "streamer": streamer}
 
             # If model.generate() raises partway through (OOM, a bad
             # shape, etc.), it can die without ever calling streamer.end()
@@ -654,7 +604,6 @@ def make_model(
                     try:
                         call_data = json.loads(match.group(1))
                         tool_call_id = str(uuid.uuid4())
-                        from pydantic_ai.models.function import DeltaToolCall
                         log.info(f"[{model_id}] (stream) Tool call detected -> {call_data.get('name')}")
                         yield {
                             0: DeltaToolCall(
