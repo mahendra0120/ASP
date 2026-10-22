@@ -17,8 +17,6 @@ wheels/
 pipeline_result.md
 .octen_faiss_index/
 
-temp_uploads/
-
 # Per-service subprocess logs (created by main.py's launch_servers())
 server_logs/
 
